@@ -1,0 +1,13 @@
+# Credentials - NEVER commit these.
+# The SSA private key is issued once and cannot be re-downloaded; anything that
+# can read it can act as the service account against your ACC data.
+secrets/
+*.pem
+.aps_token.json
+
+# Downloaded ACC content (hundreds of MB, and not ours to redistribute)
+data/
+
+__pycache__/
+*.pyc
+.DS_Store
