@@ -2,19 +2,39 @@
 
 The sibling job (acc_assets_to_s3.py) moves the *bytes* of every referenced
 document into S3. This one moves the *facts about* those documents into a single
-CSV: one row per (asset, referenced file) pair, with the asset's tag and
+CSV: one row per (project, asset, referenced file), with the asset's tag and
 category alongside the file's own metadata.
 
-    Asset             Category       Create date           Project                        File Name
+    Asset             Category       Create date           Project                          File Name
     EX-ASSET-001  Equipment Tag  2013-10-01T00:00:00Z  Example Project  WPS 8-3-3 Rev2 (10-1-13).pdf
 
-WHY A SEPARATE JOB, NOT A FLAG ON THE OTHER ONE
-  The extraction job is incremental and deliberately skips anything unchanged -
-  it only knows about the files it touched on that run. A metadata report has
-  to describe *every* reference every time, so it always does the full sweep.
-  Bolting that onto the extractor would mean two conflicting notions of "done"
-  in one script. This job downloads nothing: it is metadata calls only, so a
-  full sweep is cheap (~2 calls per reference).
+NO PROJECT ID NEEDED - THE TOKEN DEFINES THE SCOPE
+  The job asks APS what the service account can see and sweeps all of it:
+
+    /project/v1/hubs                    -> every hub the SSA belongs to
+    /project/v1/hubs/<hub>/projects     -> every project in each hub
+
+  That listing is exactly "what this identity has access to": a hub appears only
+  when the SSA is a member AND the app is provisioned in the account, and a
+  project appears only when the SSA is a member of that project. Nothing has to
+  be hardcoded, and adding the SSA to a new project is enough to include it in
+  the next run.
+
+  The listing is also where project *names* come from, so no separate name
+  lookup is needed - the id-to-name problem solves itself.
+
+  Only ACC / BIM 360 hubs are swept (extension type hubs:autodesk.bim360:Account).
+  A Fusion Team or A360 personal hub has no Assets register at all, so every
+  asset call against it would 403; those hubs are skipped with a log line rather
+  than filling the log with failures.
+
+MEMBERSHIP IS NOT THE SAME AS ASSETS ACCESS
+  Being in a project does not mean the Assets module is enabled for the SSA
+  there; the hub has 29 active projects and only some are wired for Assets. A
+  401/403/404 from the asset listing is therefore recorded as a SKIPPED project,
+  not an error - it is the normal state of most projects, and failing the run
+  over it would mean the job never went green. Anything else that goes wrong is
+  a real error and the run exits non-zero.
 
 ONE ROW PER (ASSET, FILE) PAIR
   Documents are commonly referenced by several assets - in the reference project
@@ -25,22 +45,27 @@ ONE ROW PER (ASSET, FILE) PAIR
 
 JOB PARAMETERS (--key value)
   --secret_name          AWS Secrets Manager secret holding the APS credentials
-  --project_id           ACC project id, no "b." prefix
   --s3_bucket            destination bucket
   --s3_prefix            key prefix (default: acc/assets)
   --scopes               APS scopes (default: data:read account:read)
-  --project_name         skip the project-name lookup and use this literally
+  --project_id           OPTIONAL comma-separated ids to restrict the sweep to;
+                         omit to sweep everything the SSA can reach
+  --hub_id               OPTIONAL restrict to one hub, skipping hub discovery
   --csv_key              write the CSV at exactly this key instead of the default
-  --include_folder_path  "true" to resolve each document's ACC folder (2 extra
-                         calls per *new* folder, cached; off by default)
+  --include_folder_path  "true" to resolve each document's ACC folder (one call
+                         per *new* folder, cached; off by default)
+  --split_by_project     "true" to ALSO write a per-project CSV each run
   --write_latest         "false" to skip the stable latest.csv copy
 
 OUTPUT
-  s3://<bucket>/<prefix>/_metadata/project=<id>/run=<timestamp>.csv
-  s3://<bucket>/<prefix>/_metadata/project=<id>/latest.csv   (same content)
+  s3://<bucket>/<prefix>/_metadata/run=<timestamp>.csv   every project, one file
+  s3://<bucket>/<prefix>/_metadata/latest.csv            same content
+  s3://<bucket>/<prefix>/_metadata/project=<id>/latest.csv   --split_by_project
 
-  The timestamped file is the audit trail; latest.csv is the one to point a
-  dashboard, a Glue crawler or a human at.
+  One combined CSV rather than a file per project: Project and Project Id are
+  columns, so the combined file answers both "what is in this project" and
+  "where else does this document appear" while a per-project file answers only
+  the first. --split_by_project restores the per-project layout alongside it.
 
   The CSV is written UTF-8 **with a BOM** (utf-8-sig): without it Excel opens a
   plain UTF-8 CSV in the local codepage and mangles any non-ASCII name. Be aware
@@ -50,11 +75,12 @@ OUTPUT
 
 COLUMNS
   Asset, Category, Create date, Project come first, named as asked for. After
-  them: the rest of the asset's fields, the file's own metadata, and the urns
-  needed to trace a row back to ACC. Any custom attributes defined on the asset
-  are appended as "Asset: <attribute name>" columns - the header is built from
-  the union of what the assets actually carry, so a project with no custom
-  attributes simply gets no such columns.
+  them: the rest of the asset's fields, the file's own metadata, the hub the
+  project lives in, and the urns needed to trace a row back to ACC. Any custom
+  attributes defined on the asset are appended as "Asset: <attribute name>"
+  columns - the header is built from the union of what the assets across all
+  swept projects actually carry, so two projects with different custom
+  attributes produce one CSV holding both sets, blank where a project has none.
 
   'Create date' is the *file's* creation time, since each row is a file. The
   asset's own creation time is kept separately as 'Asset Created At'.
@@ -75,11 +101,12 @@ JOB SETUP
   --extra-py-files, and one self-contained script is worth the repetition.
 
 STATUS: the asset, relationship and tip-version calls are the same ones the
-extraction job makes and are verified against this ACC tenant. NOT verified:
-the project-name lookup (/construction/admin/v1), the category and custom
-attribute definition endpoints, and the optional folder-path resolution. All
-four degrade to a logged warning and an empty column rather than failing the
-run, so a wrong guess costs a column, not the report.
+extraction job makes and are verified against this ACC tenant. Hub and project
+listing are verified by src/aps_hubs.py against the same tenant, though not as
+the SSA. NOT verified: the category, custom attribute and status definition
+endpoints, and the optional folder-path resolution. Those three degrade to a
+logged warning and an empty column rather than failing the run, so a wrong guess
+costs a column, not the report.
 """
 import csv
 import io
@@ -97,13 +124,17 @@ from datetime import datetime, timezone
 import boto3
 from awsglue.utils import getResolvedOptions
 
-SCRIPT_VERSION = "2026-09-25-a"   # logged at startup: proves which code S3 is serving
+SCRIPT_VERSION = "2026-09-25-b"   # logged at startup: proves which code S3 is serving
 
 LOG = logging.getLogger("acc_metadata")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 APS = "https://developer.api.autodesk.com"
 TOKEN_URL = f"{APS}/authentication/v2/token"
+
+# Only this kind of hub has an Assets register. The others are Fusion Team
+# ("hubs:autodesk.core:Hub") and A360 personal hubs.
+ACC_HUB_TYPE = "hubs:autodesk.bim360:Account"
 
 
 # --------------------------------------------------------------------------
@@ -162,9 +193,9 @@ def normalise_key(creds):
 class ApsToken:
     """Mints and transparently re-mints an SSA access token.
 
-    This job makes no large transfers, but a project with thousands of
-    references can still outlive an hour of metadata calls, so every caller goes
-    through .value and gets a fresh token when the old one nears expiry.
+    This job makes no large transfers, but a sweep across every project the SSA
+    can see is long enough to outlive an hour, so every caller goes through
+    .value and gets a fresh token when the old one nears expiry.
     """
 
     def __init__(self, creds, scopes):
@@ -230,6 +261,20 @@ class ApsToken:
         return self._token
 
 
+class ApsError(RuntimeError):
+    """An APS HTTP failure that still knows its status code.
+
+    The code is the whole point: 403 on a project's assets means "no Assets
+    access here", which is routine and skippable, while a 500 is a real failure.
+    A bare RuntimeError would force that decision to be made by matching on
+    message text.
+    """
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 def api(path, token, retries=4):
     """GET an APS JSON endpoint, retrying throttles and transient 5xx."""
     url = path if path.startswith("http") else APS + path
@@ -245,12 +290,12 @@ def api(path, token, retries=4):
                 LOG.warning("%s on %s, retrying in %ss", e.code, url, wait)
                 time.sleep(wait)
                 continue
-            raise RuntimeError(f"GET {url} -> {e.code}: {body}")
+            raise ApsError(e.code, f"GET {url} -> {e.code}: {body}")
         except urllib.error.URLError as e:
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
                 continue
-            raise RuntimeError(f"GET {url} failed: {e}")
+            raise ApsError(None, f"GET {url} failed: {e}")
 
 
 def paginate(path, token, limit=200):
@@ -266,31 +311,100 @@ def paginate(path, token, limit=200):
         offset += limit
 
 
+def paginate_jsonapi(path, token):
+    """Collect every page of a JSON:API endpoint by following links.next.
+
+    Data Management paginates by an opaque next link rather than limit/offset,
+    and omits the link on the last page. Following the link (instead of counting
+    pages) is what keeps this correct if the page size ever changes.
+    """
+    out, url, seen = [], path, set()
+    while url and url not in seen:
+        seen.add(url)                 # a self-referential next link would spin forever
+        d = api(url, token)
+        out += d.get("data", [])
+        url = ((d.get("links") or {}).get("next") or {}).get("href")
+    return out
+
+
 # --------------------------------------------------------------------------
-# project / category / custom attribute lookups
+# discovery: what can this identity actually see?
+# --------------------------------------------------------------------------
+def list_projects(token, hub_filter, project_filter):
+    """Every ACC project the token can reach, as {id, name, hub_id, hub_name}.
+
+    Project ids come back "b."-prefixed from Data Management; the Assets and
+    relationship APIs want them bare, so the prefix is stripped once here and
+    the rest of the job never has to think about it.
+    """
+    if hub_filter:
+        # Fetch each named hub rather than synthesising a stub: one call buys the
+        # real name for the Hub column, and a 403/404 here says plainly that the
+        # id is wrong or the SSA is not in it (see src/aps_hub_probe.py).
+        hubs = []
+        for h in hub_filter:
+            hub_id = h if h.startswith("b.") else "b." + h
+            try:
+                hubs.append(api(f"/project/v1/hubs/{hub_id}", token)["data"])
+            except ApsError as e:
+                LOG.error("hub %s could not be read (%s) - skipping", hub_id, e.status)
+        LOG.info("hub discovery skipped - using --hub_id %s", ", ".join(hub_filter))
+    else:
+        hubs = api("/project/v1/hubs", token).get("data", [])
+        if not hubs:
+            # Distinguishing the two causes needs src/aps_hub_probe.py; saying so
+            # here saves the next person the hour it cost the last one.
+            LOG.error("no hubs visible to this service account. Either the SSA is not "
+                      "a member of any account, or the app's Client ID is not "
+                      "provisioned in it (ACC Account Admin > Settings > Custom "
+                      "Integrations). src/aps_hub_probe.py tells the two apart.")
+
+    projects = []
+    for hub in hubs:
+        attrs = hub.get("attributes", {})
+        hub_name = attrs.get("name") or hub["id"]
+        kind = (attrs.get("extension") or {}).get("type", "")
+        if kind and kind != ACC_HUB_TYPE:
+            LOG.info("hub %s: %s, no Assets register - skipping", hub_name, kind)
+            continue
+        try:
+            rows = paginate_jsonapi(f"/project/v1/hubs/{hub['id']}/projects", token)
+        except ApsError as e:
+            LOG.error("hub %s: project listing failed: %s", hub_name, e)
+            continue
+        for p in rows:
+            pid = p["id"].removeprefix("b.")
+            if project_filter and pid not in project_filter:
+                continue
+            projects.append({
+                "id": pid,
+                "name": p.get("attributes", {}).get("name") or pid,
+                "hub_id": hub["id"],
+                "hub_name": hub_name,
+            })
+        LOG.info("hub %s: %d project(s)", hub_name, len(rows))
+
+    if project_filter:
+        found = {p["id"] for p in projects}
+        for missing in sorted(project_filter - found):
+            # Asked for by id but not in the listing: sweep it anyway rather than
+            # dropping it silently. If it is genuinely unreachable the asset call
+            # 403s and it is reported as skipped, which is the honest answer.
+            LOG.warning("project %s was requested but is not in the accessible "
+                        "listing - trying it anyway", missing)
+            projects.append({"id": missing, "name": missing,
+                             "hub_id": "", "hub_name": ""})
+    return projects
+
+
+# --------------------------------------------------------------------------
+# per-project lookups
 #
 # Every one of these is decoration on the report rather than the report itself,
 # so each returns a usable empty value on failure. A project where the Assets
-# admin endpoints are not reachable still gets a CSV of real file metadata,
-# with a warning in the log saying which column went blank and why.
+# admin endpoints are not reachable still gets rows of real file metadata, with
+# a warning in the log saying which column went blank and why.
 # --------------------------------------------------------------------------
-def project_display_name(project, token, override):
-    """Human-readable project name, e.g. 'Example Project'."""
-    if override:
-        return override
-    try:
-        d = api(f"/construction/admin/v1/projects/{project}", token)
-        name = d.get("name") or d.get("data", {}).get("attributes", {}).get("name")
-        if name:
-            LOG.info("project %s -> %r", project, name)
-            return name
-        LOG.warning("project lookup returned no name; falling back to the id")
-    except Exception as e:
-        LOG.warning("project name lookup failed (%s) - using the id instead. "
-                    "Pass --project_name to set it explicitly.", e)
-    return project
-
-
 def category_index(project, token):
     """categoryId -> {'name', 'parentId'} for the project's asset categories."""
     try:
@@ -298,10 +412,8 @@ def category_index(project, token):
     except Exception as e:
         LOG.warning("category lookup failed (%s) - Category column will be blank", e)
         return {}
-    index = {c["id"]: {"name": c.get("name") or "", "parentId": c.get("parentId")}
-             for c in rows if c.get("id")}
-    LOG.info("loaded %d asset categor(ies)", len(index))
-    return index
+    return {c["id"]: {"name": c.get("name") or "", "parentId": c.get("parentId")}
+            for c in rows if c.get("id")}
 
 
 def category_path(cat_id, index):
@@ -341,7 +453,6 @@ def custom_attribute_names(project, token):
         for key in (r.get("id"), r.get("name")):
             if key:
                 names[key] = label
-    LOG.info("loaded %d custom attribute definition(s)", len(rows))
     return names
 
 
@@ -360,7 +471,6 @@ def status_index(project, token):
                 if isinstance(step, dict) and step.get("id"):
                     index[step["id"]] = step.get("label") or step.get("name") or ""
         if index:
-            LOG.info("loaded %d asset status(es)", len(index))
             return index
     LOG.warning("asset status labels unavailable - Asset Status will show the raw id")
     return {}
@@ -371,9 +481,7 @@ def status_index(project, token):
 # --------------------------------------------------------------------------
 def list_assets(project, token):
     """Every asset in the project. Paginates on limit/offset."""
-    assets = paginate(f"/construction/assets/v2/projects/{project}/assets", token)
-    LOG.info("found %d asset(s) in project %s", len(assets), project)
-    return assets
+    return paginate(f"/construction/assets/v2/projects/{project}/assets", token)
 
 
 def asset_references(asset_id, project, token):
@@ -446,32 +554,51 @@ def resolve_version(lineage_urn, project, token):
 def folder_path(item_urn, project, token, cache):
     """'Project Files/Welding/WPS' for a document, or '' if it cannot be read.
 
-    Two calls per document (item -> parent folder -> that folder's own parents),
-    which is why it is opt-in. Folders are shared by many documents, so the
-    cache makes the cost per *folder* rather than per file.
+    One call for the item, then one per folder up to the root - but folders are
+    shared by many documents, so the cache means the cost is paid per *folder*
+    once rather than per file. Both halves are cached separately: items and
+    folders are different urn namespaces holding different things (a full path
+    vs. that folder's own path), and one dict for both invites a lookup that
+    silently returns the wrong kind of value.
     """
     if not item_urn:
         return ""
-    if item_urn in cache:
-        return cache[item_urn]
+    if item_urn in cache["items"]:
+        return cache["items"][item_urn]
     try:
         item = api(f"/data/v1/projects/b.{project}/items/"
                    f"{urllib.parse.quote(item_urn, safe='')}", token)
-        folder = (item["data"].get("relationships", {}).get("parent", {}).get("data") or {}).get("id")
-        names = []
-        while folder and len(names) < 20:
-            if folder in cache:                      # rest of the path already known
-                names.append(cache[folder])
-                break
-            d = api(f"/data/v1/projects/b.{project}/folders/"
-                    f"{urllib.parse.quote(folder, safe='')}", token)
-            names.append(d["data"]["attributes"].get("displayName") or "")
-            folder = (d["data"].get("relationships", {}).get("parent", {}).get("data") or {}).get("id")
-        path = "/".join(reversed([n for n in names if n]))
+        folder = (item["data"].get("relationships", {})
+                  .get("parent", {}).get("data") or {}).get("id")
+        path = _folder_chain(folder, project, token, cache)
     except Exception as e:
         LOG.warning("folder path for %s unavailable: %s", item_urn, e)
         path = ""
-    cache[item_urn] = path
+    cache["items"][item_urn] = path
+    return path
+
+
+def _folder_chain(folder_urn, project, token, cache):
+    """Walk parents to the root, then unwind - caching every folder on the way.
+
+    Walking up first and building the path on the way back down is what lets a
+    sibling document reuse the whole chain: each folder learns its own full
+    path, not just its name.
+    """
+    chain, node = [], folder_urn
+    while node and node not in cache["folders"] and len(chain) < 20:
+        d = api(f"/data/v1/projects/b.{project}/folders/"
+                f"{urllib.parse.quote(node, safe='')}", token)
+        name = d["data"]["attributes"].get("displayName") or ""
+        parent = (d["data"].get("relationships", {})
+                  .get("parent", {}).get("data") or {}).get("id")
+        chain.append((node, name))
+        node = parent
+
+    path = cache["folders"].get(node, "") if node else ""
+    for fid, name in reversed(chain):
+        path = f"{path}/{name}" if path else name
+        cache["folders"][fid] = path
     return path
 
 
@@ -488,7 +615,7 @@ TAIL_COLUMNS = [
     "Folder Path",
     "Category Path", "Asset Description", "Asset Status", "Asset Barcode",
     "Asset Created At", "Asset Updated At",
-    "Project Id", "Asset Id", "Lineage URN", "Version URN", "Storage URN",
+    "Hub", "Project Id", "Asset Id", "Lineage URN", "Version URN", "Storage URN",
     "Extracted At",
 ]
 
@@ -548,6 +675,7 @@ def build_row(asset, info, ctx):
         "Asset Created At": asset.get("createdAt"),
         "Asset Updated At": asset.get("updatedAt"),
 
+        "Hub": ctx["hub_name"],
         "Project Id": ctx["project"],
         "Asset Id": asset.get("id"),
         "Lineage URN": info["lineage_urn"],
@@ -564,7 +692,8 @@ def to_csv(rows):
 
     Custom attributes differ per project and sometimes per asset, so the header
     cannot be a fixed list: a DictWriter over a short header would raise on the
-    first asset carrying an attribute the header does not mention.
+    first asset carrying an attribute the header does not mention. Across a
+    multi-project sweep this is the norm rather than an edge case.
     """
     extra = sorted({k for r in rows for k in r} - set(LEAD_COLUMNS) - set(TAIL_COLUMNS))
     header = LEAD_COLUMNS + TAIL_COLUMNS + extra
@@ -572,7 +701,8 @@ def to_csv(rows):
     w = csv.DictWriter(buf, fieldnames=header, restval="", extrasaction="raise",
                        lineterminator="\r\n")   # CRLF: Excel's expectation
     w.writeheader()
-    for row in sorted(rows, key=lambda r: (str(r["Asset"]), str(r["File Name"]))):
+    for row in sorted(rows, key=lambda r: (str(r["Project"]), str(r["Asset"]),
+                                           str(r["File Name"]))):
         w.writerow({k: ("" if v is None else v) for k, v in row.items()})
     return buf.getvalue()
 
@@ -589,24 +719,103 @@ def put_csv(s3, bucket, key, text):
 
 
 # --------------------------------------------------------------------------
+def sweep_project(proj, token, include_folders, stats):
+    """Every (asset, reference) row for one project. [] if it has no Assets."""
+    try:
+        assets = list_assets(proj["id"], token)
+    except ApsError as e:
+        if e.status in (401, 403, 404):
+            # Membership in a project does not imply the Assets module is on for
+            # this identity there. Routine, and most of the hub looks like this.
+            LOG.info("project %s: no Assets access (%s) - skipping", proj["name"], e.status)
+            stats["projects_skipped"] += 1
+            return []
+        LOG.error("project %s: asset listing failed: %s", proj["name"], e)
+        stats["errors"] += 1
+        return []
+    except Exception as e:
+        LOG.error("project %s: asset listing failed: %s", proj["name"], e)
+        stats["errors"] += 1
+        return []
+
+    if not assets:
+        LOG.info("project %s: Assets enabled but empty", proj["name"])
+        stats["projects_swept"] += 1
+        return []
+
+    LOG.info("project %s (%s): %d asset(s)", proj["name"], proj["id"], len(assets))
+    stats["projects_swept"] += 1
+    ctx = {
+        "project": proj["id"],
+        "project_name": proj["name"],
+        "hub_name": proj["hub_name"],
+        "categories": category_index(proj["id"], token),
+        "attr_names": custom_attribute_names(proj["id"], token),
+        "statuses": status_index(proj["id"], token),
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Folder and category ids are project-scoped, so the caches are too - one
+    # sweep-wide cache would hand project B a path resolved inside project A.
+    folders = {"items": {}, "folders": {}}
+
+    rows = []
+    for asset in assets:
+        tag = asset.get("clientAssetId") or asset["id"]
+        stats["assets"] += 1
+        try:
+            lineages = asset_references(asset["id"], proj["id"], token)
+        except Exception as e:                      # one bad asset must not kill the run
+            LOG.error("asset %s: reference lookup failed: %s", tag, e)
+            stats["errors"] += 1
+            continue
+
+        stats["references"] += len(lineages)
+        for urn in lineages:
+            try:
+                info = resolve_version(urn, proj["id"], token)
+                info["lineage_urn"] = urn
+                if include_folders:
+                    info["folder_path"] = folder_path(info["item_urn"], proj["id"],
+                                                      token, folders)
+                if not info["has_file"]:
+                    stats["no_file"] += 1
+                rows.append(build_row(asset, info, ctx))
+                stats["rows"] += 1
+            except Exception as e:
+                LOG.error("  reference %s failed: %s", urn, e)
+                stats["errors"] += 1
+    return rows
+
+
 def main():
-    args = getResolvedOptions(sys.argv, ["secret_name", "project_id", "s3_bucket"])
+    args = getResolvedOptions(sys.argv, ["secret_name", "s3_bucket"])
     # optional params, resolved separately so their absence is not fatal
     optional = {
         "s3_prefix": "acc/assets",
         "scopes": "data:read account:read",
-        "project_name": "",
+        "project_id": "",
+        "hub_id": "",
         "csv_key": "",
         "include_folder_path": "false",
+        "split_by_project": "false",
         "write_latest": "true",
     }
     for key, default in optional.items():
         flag = f"--{key}"
         optional[key] = sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
     include_folders = optional["include_folder_path"].lower() == "true"
+    split_by_project = optional["split_by_project"].lower() == "true"
     write_latest = optional["write_latest"].lower() != "false"
 
-    project = args["project_id"].removeprefix("b.")
+    def id_set(raw, strip_b):
+        out = set()
+        for part in raw.replace(" ", "").split(","):
+            if part:
+                out.add(part.removeprefix("b.") if strip_b else part)
+        return out
+
+    project_filter = id_set(optional["project_id"], strip_b=True)
+    hub_filter = sorted(id_set(optional["hub_id"], strip_b=False))
     bucket = args["s3_bucket"]
     prefix = optional["s3_prefix"].strip("/")
 
@@ -618,56 +827,43 @@ def main():
     s3 = boto3.client("s3")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    ctx = {
-        "project": project,
-        "project_name": project_display_name(project, token, optional["project_name"]),
-        "categories": category_index(project, token),
-        "attr_names": custom_attribute_names(project, token),
-        "statuses": status_index(project, token),
-        "extracted_at": datetime.now(timezone.utc).isoformat(),
-    }
+    stats = {"projects_discovered": 0, "projects_swept": 0, "projects_skipped": 0,
+             "assets": 0, "references": 0, "rows": 0, "no_file": 0, "errors": 0}
 
-    rows, folders = [], {}
-    stats = {"assets": 0, "references": 0, "rows": 0, "no_file": 0, "errors": 0}
+    projects = list_projects(token, hub_filter, project_filter)
+    stats["projects_discovered"] = len(projects)
+    LOG.info("%d project(s) to sweep%s", len(projects),
+             " (filtered)" if project_filter or hub_filter else "")
 
-    for asset in list_assets(project, token):
-        tag = asset.get("clientAssetId") or asset["id"]
-        stats["assets"] += 1
-        try:
-            lineages = asset_references(asset["id"], project, token)
-        except Exception as e:                      # one bad asset must not kill the run
-            LOG.error("asset %s: reference lookup failed: %s", tag, e)
-            stats["errors"] += 1
-            continue
-
-        LOG.info("asset %s: %d reference(s)", tag, len(lineages))
-        stats["references"] += len(lineages)
-        for urn in lineages:
-            try:
-                info = resolve_version(urn, project, token)
-                info["lineage_urn"] = urn
-                if include_folders:
-                    info["folder_path"] = folder_path(info["item_urn"], project, token, folders)
-                if not info["has_file"]:
-                    stats["no_file"] += 1
-                rows.append(build_row(asset, info, ctx))
-                stats["rows"] += 1
-            except Exception as e:
-                LOG.error("  reference %s failed: %s", urn, e)
-                stats["errors"] += 1
+    rows, by_project = [], {}
+    for proj in projects:
+        project_rows = sweep_project(proj, token, include_folders, stats)
+        rows += project_rows
+        if project_rows:
+            by_project[proj["id"]] = project_rows
 
     if not rows:
-        # No CSV at all is a worse outcome than an empty one: a downstream
-        # reader cannot tell "job never ran" from "project has no references".
-        LOG.warning("no references found in project %s - writing a header-only csv", project)
+        # No CSV at all is a worse outcome than an empty one: a downstream reader
+        # cannot tell "job never ran" from "nothing to report".
+        LOG.warning("no references found in any accessible project - "
+                    "writing a header-only csv")
 
     text = to_csv(rows)
-    key = optional["csv_key"] or f"{prefix}/_metadata/project={project}/run={run_id}.csv"
+    key = optional["csv_key"] or f"{prefix}/_metadata/run={run_id}.csv"
     put_csv(s3, bucket, key, text)
     if write_latest and not optional["csv_key"]:
-        put_csv(s3, bucket, f"{prefix}/_metadata/project={project}/latest.csv", text)
+        put_csv(s3, bucket, f"{prefix}/_metadata/latest.csv", text)
+    if split_by_project:
+        for pid, project_rows in by_project.items():
+            put_csv(s3, bucket, f"{prefix}/_metadata/project={pid}/latest.csv",
+                    to_csv(project_rows))
 
     LOG.info("done: %s", json.dumps(stats))
+    if not projects:
+        raise SystemExit(
+            "no projects are visible to this service account - nothing was swept. "
+            "The SSA needs its own ACC project invite with the Assets module "
+            "enabled; see the Authentication section of the README.")
     if stats["errors"]:
         # surface partial failure to Glue rather than reporting a green run
         raise SystemExit(f"completed with {stats['errors']} error(s); "

@@ -134,6 +134,10 @@ never downloads a file and never reads S3 back, so `s3:GetObject`,
 `s3:ListBucket` and `s3:AbortMultipartUpload` go unused by this job — they are
 there for the extraction job.
 
+Note there is **no `--project_id`**: the job sweeps every project the service
+account can reach. The AWS side does not change when a project is added to the
+SSA in ACC.
+
 ```bash
 aws glue create-job --name acc-asset-file-metadata \
   --role "arn:aws:iam::${ACCOUNT}:role/${ROLE}" \
@@ -141,12 +145,15 @@ aws glue create-job --name acc-asset-file-metadata \
   --default-arguments "{
     \"--additional-python-modules\":\"PyJWT==2.10.1,cryptography==43.0.1\",
     \"--secret_name\":\"${SECRET}\",
-    \"--project_id\":\"22222222-2222-2222-2222-222222222222\",
     \"--s3_bucket\":\"${DATA_BUCKET}\",
     \"--s3_prefix\":\"${PREFIX}\"
   }" \
   --max-capacity 1.0
 ```
+
+Sweeping every project makes this job longer than the extraction job, not
+heavier — it transfers nothing. If it ever approaches Glue's timeout, `--hub_id`
+or a comma-separated `--project_id` splits it across runs.
 
 If you point `--csv_key` somewhere outside `${PREFIX}/`, widen the
 `WriteExtractedFiles` resource to match — otherwise the run does all its work
