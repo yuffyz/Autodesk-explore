@@ -9,10 +9,11 @@ import base64, http.server, json, os, secrets, stat, time
 import urllib.error, urllib.parse, urllib.request, webbrowser
 from pathlib import Path
 
-# CLIENT_ID     = os.environ.get("APS_CLIENT_ID", "")
-# CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET", "")
-CLIENT_ID     = "***REMOVED-CLIENT-ID***"
-CLIENT_SECRET = "***REMOVED-CLIENT-SECRET***"
+# Credentials come from the environment, never from this file - it is committed.
+#   export APS_CLIENT_ID=...
+#   export APS_CLIENT_SECRET=...
+CLIENT_ID     = os.environ.get("APS_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET", "")
 REDIRECT_URI  = "http://localhost:8080/"          # must match the portal EXACTLY
 # offline_access is what gets us a refresh_token, so we can skip the browser later.
 SCOPES        = "data:read data:write account:read offline_access"
