@@ -80,6 +80,8 @@ from datetime import datetime, timezone
 import boto3
 from awsglue.utils import getResolvedOptions
 
+SCRIPT_VERSION = "2026-09-24-b"   # logged at startup: proves which code S3 is serving
+
 LOG = logging.getLogger("acc_extract")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -90,6 +92,64 @@ TOKEN_URL = f"{APS}/authentication/v2/token"
 # --------------------------------------------------------------------------
 # auth
 # --------------------------------------------------------------------------
+def normalise_key(creds):
+    """Validate the secret and say precisely what is wrong with it.
+
+    PyJWT reports every unloadable key as "Could not parse the provided public
+    key", which is the same message for a double-escaped PEM, a truncated one, a
+    base64-wrapped one and an empty string. That message alone cannot tell you
+    which, so check here and name the actual fault.
+    """
+    required = ("client_id", "client_secret", "ssa_id", "ssa_kid", "ssa_private_key")
+    missing = [k for k in required if k not in creds]
+    empty   = [k for k in required if k in creds and not str(creds[k]).strip()]
+    if missing:
+        raise RuntimeError(
+            f"secret is missing key(s) {missing}. Present: {sorted(creds)}. "
+            f"Expected exactly: {list(required)}")
+    if empty:
+        raise RuntimeError(f"secret has empty value(s) for {empty}")
+
+    pem = creds["ssa_private_key"]
+    LOG.info("key diagnostics: chars=%d real_newlines=%d literal_backslash_n=%d "
+             "starts=%r ends=%r",
+             len(pem), pem.count("\n"), pem.count("\\n"),
+             pem[:28], pem.strip()[-26:])
+
+    if "\\n" in pem and "\n" not in pem:
+        LOG.warning("private key is double-escaped; un-escaping. "
+                    "Rewrite the secret with --secret-string file://<json>.")
+        pem = pem.replace("\\n", "\n")
+        creds = dict(creds, ssa_private_key=pem)
+
+    stripped = pem.strip()
+    if not stripped.startswith("-----BEGIN"):
+        raise RuntimeError(
+            "ssa_private_key does not begin with -----BEGIN. "
+            f"It starts with {stripped[:40]!r}. If that looks like base64, the PEM "
+            "was encoded again before being stored; store the PEM text itself.")
+    if "-----END" not in stripped:
+        raise RuntimeError(
+            f"ssa_private_key has no -----END line (length {len(stripped)}). "
+            "The value is truncated — Secrets Manager holds only part of the key.")
+    if stripped.count("\n") < 3:
+        raise RuntimeError(
+            f"ssa_private_key has {stripped.count(chr(10))} line breaks; a PEM needs "
+            "many. The newlines were lost when the secret was written.")
+
+    # Final proof: load it here, so failure is reported against the key itself
+    # rather than surfacing later as PyJWT's generic message.
+    try:
+        from cryptography.hazmat.primitives import serialization
+        serialization.load_pem_private_key(stripped.encode(), password=None)
+    except Exception as e:
+        raise RuntimeError(
+            f"ssa_private_key is a PEM but will not load: {type(e).__name__}: {e}. "
+            "Re-issue the key with aps_service_account.py if it cannot be recovered.")
+    LOG.info("private key loaded and validated")
+    return creds
+
+
 class ApsToken:
     """Mints and transparently re-mints an SSA access token.
 
@@ -356,8 +416,10 @@ def main():
     bucket = args["s3_bucket"]
     prefix = optional["s3_prefix"].strip("/")
 
+    LOG.info("acc_assets_to_s3 version %s", SCRIPT_VERSION)
     sm = boto3.client("secretsmanager")
     creds = json.loads(sm.get_secret_value(SecretId=args["secret_name"])["SecretString"])
+    creds = normalise_key(creds)
     token = ApsToken(creds, optional["scopes"])
     s3 = boto3.client("s3")
 

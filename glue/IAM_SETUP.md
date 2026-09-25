@@ -126,6 +126,32 @@ aws glue create-job --name acc-assets-to-s3 \
   --max-capacity 1.0
 ```
 
+## 6. The metadata job — same role, second job
+
+`acc_asset_file_metadata.py` writes a CSV under `${PREFIX}/_metadata/` and reads
+the same secret, so the role above already covers it: no new permissions. It
+never downloads a file and never reads S3 back, so `s3:GetObject`,
+`s3:ListBucket` and `s3:AbortMultipartUpload` go unused by this job — they are
+there for the extraction job.
+
+```bash
+aws glue create-job --name acc-asset-file-metadata \
+  --role "arn:aws:iam::${ACCOUNT}:role/${ROLE}" \
+  --command "Name=pythonshell,PythonVersion=3.9,ScriptLocation=s3://${CODE_BUCKET}/acc_asset_file_metadata.py" \
+  --default-arguments "{
+    \"--additional-python-modules\":\"PyJWT==2.10.1,cryptography==43.0.1\",
+    \"--secret_name\":\"${SECRET}\",
+    \"--project_id\":\"22222222-2222-2222-2222-222222222222\",
+    \"--s3_bucket\":\"${DATA_BUCKET}\",
+    \"--s3_prefix\":\"${PREFIX}\"
+  }" \
+  --max-capacity 1.0
+```
+
+If you point `--csv_key` somewhere outside `${PREFIX}/`, widen the
+`WriteExtractedFiles` resource to match — otherwise the run does all its work
+and 403s on the final `put_object`.
+
 ## Two extras, only if they apply
 
 **Bucket encrypted with SSE-KMS** — add to the inline policy, or every write 403s:
