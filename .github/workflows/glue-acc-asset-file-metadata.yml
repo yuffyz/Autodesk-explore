@@ -1,0 +1,91 @@
+# CI/CD for glue/acc_asset_file_metadata.py.
+#
+#   pull request      -> check only
+#   push to main      -> check, then deploy to the "dev" Environment
+#   manual dispatch   -> check, then deploy to the Environment you pick
+#
+# Each GitHub Environment is one AWS account: its variables name the account's
+# deploy role, buckets and secret, so adding an account is adding an Environment
+# (see glue/deploy/DEPLOY.md). Put required reviewers on "prod" in the repo's
+# Environment settings to gate it.
+name: glue / acc-asset-file-metadata
+
+on:
+  pull_request:
+    paths:
+      - glue/acc_asset_file_metadata.py
+      - glue/deploy/deploy_glue_job.sh
+      - .github/workflows/glue-acc-asset-file-metadata.yml
+  push:
+    branches: [main]
+    paths:
+      - glue/acc_asset_file_metadata.py
+      - glue/deploy/deploy_glue_job.sh
+      - .github/workflows/glue-acc-asset-file-metadata.yml
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment (= AWS account) to deploy to
+        type: environment
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Glue Python Shell runs 3.9, so check against 3.9 rather than whatever
+      # the runner ships with - a 3.10+ construct would pass there and die in Glue.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Compile under Python 3.9
+        run: python -m py_compile glue/acc_asset_file_metadata.py
+
+      - name: Lint (syntax errors and pyflakes)
+        run: |
+          pip install --quiet ruff
+          ruff check --select E9,F --target-version py39 glue/acc_asset_file_metadata.py
+
+      - name: Shellcheck the deploy script
+        run: shellcheck glue/deploy/deploy_glue_job.sh
+
+  deploy:
+    needs: check
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    # Two deploys to the same account must not interleave their update-job calls.
+    concurrency:
+      group: glue-acc-asset-file-metadata-${{ inputs.environment || 'dev' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write          # OIDC: no AWS keys are stored in GitHub
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-${{ github.run_id }}
+
+      - name: Deploy Glue job
+        run: glue/deploy/deploy_glue_job.sh
+        env:
+          CODE_BUCKET: ${{ vars.CODE_BUCKET }}
+          GLUE_ROLE_ARN: ${{ vars.GLUE_ROLE_ARN }}
+          DATA_BUCKET: ${{ vars.DATA_BUCKET }}
+          SECRET_NAME: ${{ vars.SECRET_NAME }}
+          JOB_NAME: ${{ vars.JOB_NAME }}
+          CODE_PREFIX: ${{ vars.CODE_PREFIX }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+          TIMEOUT_MINUTES: ${{ vars.TIMEOUT_MINUTES }}
+          EXTRA_ARGS_JSON: ${{ vars.EXTRA_ARGS_JSON }}
+          VERSION: ${{ github.sha }}

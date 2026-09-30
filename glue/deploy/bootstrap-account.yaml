@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time setup, per AWS account, for deploying the ACC metadata Glue job from
+  GitHub Actions. Creates the role GitHub assumes to deploy (via OIDC, no stored
+  keys) and the role the Glue job runs as.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: yuffyz/Autodesk-explore
+    Description: owner/repo allowed to deploy into this account
+  GitHubEnvironment:
+    Type: String
+    Default: dev
+    Description: >
+      GitHub Environment name whose deploy job may assume the deploy role
+      (dev, prod, ...). Only runs bound to this Environment get in.
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "false" if this account already has the token.actions.githubusercontent.com
+      provider - an account can hold only one.
+  CodeBucket:
+    Type: String
+    Description: existing bucket the Glue script is uploaded to
+  CodePrefix:
+    Type: String
+    Default: glue-scripts
+  DataBucket:
+    Type: String
+    Description: existing bucket the job writes its CSV to
+  DataPrefix:
+    Type: String
+    Default: acc/assets
+  SecretName:
+    Type: String
+    Default: aps/acc-extract
+    Description: Secrets Manager secret holding the APS credentials
+  JobName:
+    Type: String
+    Default: acc-asset-file-metadata
+
+Conditions:
+  MakeOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # The role the job runs as. Scoped to this job alone: it writes only under
+  # <prefix>/_metadata/ and never reads data back (see IAM_SETUP.md section 6).
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub AWSGlueServiceRole-${JobName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub ${JobName}-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadTheApsCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*
+              - Sid: WriteTheCsv
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${DataBucket}/${DataPrefix}/_metadata/*
+              - Sid: ReadTheJobScript
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${CodeBucket}/${CodePrefix}/${JobName}/*
+
+  # The role GitHub Actions assumes. It can upload the script, manage this one
+  # job, and hand the job its role - nothing else.
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub github-deploy-${JobName}-${GitHubEnvironment}
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:environment:${GitHubEnvironment}
+      Policies:
+        - PolicyName: deploy-glue-job
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UploadScript
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${CodeBucket}/${CodePrefix}/${JobName}/*
+              - Sid: ManageTheJob
+                Effect: Allow
+                Action: [glue:GetJob, glue:CreateJob, glue:UpdateJob]
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${JobName}
+              - Sid: HandTheJobItsRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt GlueJobRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: glue.amazonaws.com
+
+Outputs:
+  DeployRoleArn:
+    Description: set as the AWS_DEPLOY_ROLE_ARN variable on the GitHub Environment
+    Value: !GetAtt GitHubDeployRole.Arn
+  GlueJobRoleArn:
+    Description: set as the GLUE_ROLE_ARN variable on the GitHub Environment
+    Value: !GetAtt GlueJobRole.Arn
