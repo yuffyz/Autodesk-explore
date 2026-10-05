@@ -13,7 +13,8 @@
 #             SCRIPT_PATH      default glue/acc_asset_file_metadata.py
 #             CODE_PREFIX      default glue-scripts
 #             S3_PREFIX        default acc/assets
-#             PYTHON_MODULES   default PyJWT==2.10.1,cryptography==43.0.1
+#             PYTHON_MODULES   default PyJWT==2.10.1,cryptography==43.0.1,
+#                              snowflake-connector-python==3.13.2
 #             PYTHON_VERSION   default 3.9
 #             TIMEOUT_MINUTES  default 180
 #             EXTRA_ARGS_JSON  default {} - merged into the job's default
@@ -34,7 +35,7 @@ JOB_NAME="${JOB_NAME:-acc-asset-file-metadata}"
 SCRIPT_PATH="${SCRIPT_PATH:-glue/acc_asset_file_metadata.py}"
 CODE_PREFIX="${CODE_PREFIX:-glue-scripts}"
 S3_PREFIX="${S3_PREFIX:-acc/assets}"
-PYTHON_MODULES="${PYTHON_MODULES:-PyJWT==2.10.1,cryptography==43.0.1}"
+PYTHON_MODULES="${PYTHON_MODULES:-PyJWT==2.10.1,cryptography==43.0.1,snowflake-connector-python==3.13.2}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.9}"
 TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-180}"
 EXTRA_ARGS_JSON="${EXTRA_ARGS_JSON:-}"

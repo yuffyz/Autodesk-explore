@@ -83,6 +83,33 @@ since none of these values are sensitive):
 | `TIMEOUT_MINUTES` | no | default `180` |
 | `EXTRA_ARGS_JSON` | no | extra job arguments for this account, for example `{"--hub_id":"b.xxx","--split_by_project":"true"}` |
 
+### Loading into Snowflake (optional)
+
+The job also loads its rows into a Snowflake table when it is given
+`--snowflake_secret_name`. To turn that on for an account:
+
+1. Store the Snowflake credentials as their own secret. Key-pair auth is
+   preferred; `password` works in place of `private_key`:
+   ```json
+   {"account": "xy12345.us-east-1", "user": "SVC_ACC_LOADER",
+    "private_key": "-----BEGIN PRIVATE KEY-----\n...", "role": "ACC_LOADER",
+    "warehouse": "LOAD_WH", "database": "RAW", "schema": "ACC"}
+   ```
+2. Re-deploy the bootstrap stack with `SnowflakeSecretName=<that secret>` so the
+   job role can read it.
+3. Add it to the Environment's `EXTRA_ARGS_JSON`, for example
+   `{"--snowflake_secret_name":"snowflake/acc-loader"}`. Optional overrides:
+   `--snowflake_database`, `--snowflake_schema`, `--snowflake_table` (default
+   `ACC_ASSET_FILE_METADATA`) and `--snowflake_mode` (`replace` or `append`).
+
+On the Snowflake side, the role needs USAGE on the warehouse, database and
+schema. It needs CREATE TABLE on the schema for the first run, or you can create
+the table up front. After that it needs SELECT, INSERT and DELETE on the table.
+If the Snowflake account has a network policy, it must allow the job's egress
+addresses. A Glue job with no VPC connection egresses from AWS's shared ranges,
+so a strict policy needs the job on a VPC connection with a NAT gateway that
+has a fixed IP.
+
 To gate production, add **Required reviewers** and restrict **Deployment
 branches** to `main` on that Environment. A deploy then waits for approval.
 

@@ -56,6 +56,12 @@ JOB PARAMETERS (--key value)
                          per *new* folder, cached; off by default)
   --split_by_project     "true" to ALSO write a per-project CSV each run
   --write_latest         "false" to skip the stable latest.csv copy
+  --snowflake_secret_name  OPTIONAL secret holding Snowflake credentials; when
+                         set, the rows are ALSO loaded into a Snowflake table
+  --snowflake_database   default: the secret's "database"
+  --snowflake_schema     default: the secret's "schema"
+  --snowflake_table      default: ACC_ASSET_FILE_METADATA (created if missing)
+  --snowflake_mode       "replace" (default) or "append"; see SNOWFLAKE below
 
 OUTPUT
   s3://<bucket>/<prefix>/_metadata/run=<timestamp>.csv   every project, one file
@@ -72,6 +78,34 @@ OUTPUT
   Excel still reformats anything that *looks* like a number or a date on open -
   it will eat leading zeros in a tag. Import as text, or read the CSV with
   pandas/Athena, if that matters.
+
+SNOWFLAKE
+  Off unless --snowflake_secret_name is given. The CSV is always written first,
+  so a Snowflake failure costs the table load, not the report - the run still
+  exits non-zero so it is noticed.
+
+  The table has fixed, typed columns (snake-case versions of the CSV headers,
+  e.g. "Create date" -> FILE_CREATED_AT TIMESTAMP_TZ, "Size (bytes)" ->
+  FILE_SIZE_BYTES NUMBER), plus CUSTOM_ATTRIBUTES VARIANT, RUN_ID and LOADED_AT.
+  Custom attributes go in the VARIANT rather than columns of their own because
+  they differ per project, and a column each would mean an ALTER per new one:
+      SELECT custom_attributes:"Serial Number"::string FROM ...
+
+  replace  deletes then inserts, per project, in one transaction. Only projects
+           swept with no errors are replaced: a project that failed part-way
+           keeps its previous rows, and a project filtered out by --project_id
+           or --hub_id is never touched. The table is always "the latest good
+           sweep of each project".
+  append   inserts every run's rows; RUN_ID tells runs apart. History, at the
+           cost of filtering on the latest RUN_ID per project downstream.
+
+  Snowflake secret (JSON), key-pair auth preferred:
+  {"account","user","private_key","private_key_passphrase"?,"role"?,
+   "warehouse"?,"database"?,"schema"?}   - or "password" instead of the key.
+
+  Grants: USAGE on the warehouse, database and schema; CREATE TABLE on the
+  schema for the first run (or create the table up front), then SELECT, INSERT
+  and DELETE on it.
 
 COLUMNS
   Asset, Category, Create date, Project come first, named as asked for. After
@@ -91,8 +125,12 @@ SECRET SHAPE (JSON)
 
 JOB SETUP
   Type            Python Shell (Python 3.9), 1 DPU
-  --additional-python-modules   PyJWT==2.10.1,cryptography==43.0.1
-  IAM             secretsmanager:GetSecretValue on the secret,
+  --additional-python-modules   PyJWT==2.10.1,cryptography==43.0.1,
+                                snowflake-connector-python==3.13.2
+                  (3.13.2, not newer: 3.16+ pulls in its own boto3 and
+                  replaces the one Glue ships)
+  IAM             secretsmanager:GetSecretValue on the secret (and on the
+                  Snowflake secret, if used),
                   s3:PutObject on <prefix>/_metadata/*
                   (no s3:GetObject needed - this job never reads S3 back)
 
@@ -124,7 +162,7 @@ from datetime import datetime, timezone
 import boto3
 from awsglue.utils import getResolvedOptions
 
-SCRIPT_VERSION = "2026-09-25-b"   # logged at startup: proves which code S3 is serving
+SCRIPT_VERSION = "2026-10-05-a"   # logged at startup: proves which code S3 is serving
 
 LOG = logging.getLogger("acc_metadata")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -719,6 +757,212 @@ def put_csv(s3, bucket, key, text):
 
 
 # --------------------------------------------------------------------------
+# Snowflake  (optional - only when --snowflake_secret_name is given)
+# --------------------------------------------------------------------------
+# CSV header -> (Snowflake column, type). Unlike the CSV header this is fixed:
+# custom attributes differ per project, so rather than ALTER the table each time
+# a project grows a new one, they travel together in one VARIANT column.
+SNOWFLAKE_COLUMNS = [
+    ("Asset",             "ASSET",                 "VARCHAR"),
+    ("Category",          "CATEGORY",              "VARCHAR"),
+    ("Create date",       "FILE_CREATED_AT",       "TIMESTAMP_TZ"),
+    ("Project",           "PROJECT",               "VARCHAR"),
+    ("File Name",         "FILE_NAME",             "VARCHAR"),
+    ("File Extension",    "FILE_EXTENSION",        "VARCHAR"),
+    ("File Type",         "FILE_TYPE",             "VARCHAR"),
+    ("Source File Name",  "SOURCE_FILE_NAME",      "VARCHAR"),
+    ("Created By",        "FILE_CREATED_BY",       "VARCHAR"),
+    ("Last Modified",     "FILE_LAST_MODIFIED_AT", "TIMESTAMP_TZ"),
+    ("Last Modified By",  "FILE_LAST_MODIFIED_BY", "VARCHAR"),
+    ("Version",           "FILE_VERSION",          "NUMBER"),
+    ("Size (bytes)",      "FILE_SIZE_BYTES",       "NUMBER"),
+    ("MIME Type",         "MIME_TYPE",             "VARCHAR"),
+    ("Has File",          "HAS_FILE",              "BOOLEAN"),
+    ("Process State",     "PROCESS_STATE",         "VARCHAR"),
+    ("Folder Path",       "FOLDER_PATH",           "VARCHAR"),
+    ("Category Path",     "CATEGORY_PATH",         "VARCHAR"),
+    ("Asset Description", "ASSET_DESCRIPTION",     "VARCHAR"),
+    ("Asset Status",      "ASSET_STATUS",          "VARCHAR"),
+    ("Asset Barcode",     "ASSET_BARCODE",         "VARCHAR"),
+    ("Asset Created At",  "ASSET_CREATED_AT",      "TIMESTAMP_TZ"),
+    ("Asset Updated At",  "ASSET_UPDATED_AT",      "TIMESTAMP_TZ"),
+    ("Hub",               "HUB",                   "VARCHAR"),
+    ("Project Id",        "PROJECT_ID",            "VARCHAR"),
+    ("Asset Id",          "ASSET_ID",              "VARCHAR"),
+    ("Lineage URN",       "LINEAGE_URN",           "VARCHAR"),
+    ("Version URN",       "VERSION_URN",           "VARCHAR"),
+    ("Storage URN",       "STORAGE_URN",           "VARCHAR"),
+    ("Extracted At",      "EXTRACTED_AT",          "TIMESTAMP_TZ"),
+]
+# A column added to the CSV but not here would be silently dropped from the
+# table; fail at import instead.
+assert [c[0] for c in SNOWFLAKE_COLUMNS] == LEAD_COLUMNS + TAIL_COLUMNS
+
+# Rows go up as one multi-row INSERT per chunk. Small enough to stay well under
+# Snowflake's statement-size limit with long URNs and descriptions.
+SNOWFLAKE_CHUNK = 200
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def sf_ident(name, what):
+    """An identifier safe to interpolate. Values are bound; identifiers cannot
+    be, so they are restricted to the unquoted form instead."""
+    if not IDENT_RE.match(name or ""):
+        raise RuntimeError(f"snowflake {what} {name!r} is not a plain identifier "
+                           "(letters, digits, _ and $; must not start with a digit)")
+    return name.upper()
+
+
+def snowflake_config(secret, optional):
+    """Connection settings from the secret, with job parameters overriding where
+    to write. Checked before the sweep so a bad secret fails in seconds rather
+    than after an hour of APS calls."""
+    for k in ("account", "user"):
+        if not str(secret.get(k, "")).strip():
+            raise RuntimeError(f"snowflake secret is missing {k!r}. Present: {sorted(secret)}")
+    if not (secret.get("private_key") or secret.get("password")):
+        raise RuntimeError("snowflake secret needs private_key (preferred) or password")
+    database = optional["snowflake_database"] or secret.get("database", "")
+    schema = optional["snowflake_schema"] or secret.get("schema", "")
+    table = optional["snowflake_table"]
+    mode = optional["snowflake_mode"].lower()
+    if mode not in ("replace", "append"):
+        raise RuntimeError(f"--snowflake_mode must be replace or append, got {mode!r}")
+    fq_table = ".".join([sf_ident(database, "database"), sf_ident(schema, "schema"),
+                         sf_ident(table, "table")])
+    return {"secret": secret, "database": database.upper(), "schema": schema.upper(),
+            "table": table.upper(), "fq_table": fq_table, "mode": mode}
+
+
+def snowflake_connect(cfg):
+    """Key-pair auth when the secret has a key, password otherwise.
+
+    Snowflake is retiring password-only sign-in for service users, so the key is
+    the path that keeps working; password stays for accounts not there yet.
+    """
+    import snowflake.connector   # supplied via --additional-python-modules
+
+    s = cfg["secret"]
+    kwargs = {
+        "account": s["account"],
+        "user": s["user"],
+        "database": cfg["database"],
+        "schema": cfg["schema"],
+        "application": "acc_asset_file_metadata",
+        "login_timeout": 60,
+    }
+    for k in ("role", "warehouse"):
+        if s.get(k):
+            kwargs[k] = s[k]
+    if s.get("private_key"):
+        from cryptography.hazmat.primitives import serialization
+        pem = s["private_key"]
+        if "\\n" in pem and "\n" not in pem:
+            pem = pem.replace("\\n", "\n")   # same double-escape trap as the APS key
+        passphrase = s.get("private_key_passphrase")
+        key = serialization.load_pem_private_key(
+            pem.strip().encode(), password=passphrase.encode() if passphrase else None)
+        kwargs["private_key"] = key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption())
+    else:
+        kwargs["password"] = s["password"]
+    return snowflake.connector.connect(**kwargs)
+
+
+def snowflake_ddl(fq_table):
+    cols = [f"{name} {kind}" for _, name, kind in SNOWFLAKE_COLUMNS]
+    cols += ["CUSTOM_ATTRIBUTES VARIANT", "RUN_ID VARCHAR",
+             "LOADED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()"]
+    return f"CREATE TABLE {fq_table} (\n  " + ",\n  ".join(cols) + "\n)"
+
+
+def snowflake_values(row, run_id):
+    """One row as bind values: every typed column as text, converted in SQL.
+
+    Converting server-side with TRY_ functions means one malformed timestamp
+    becomes a NULL in that cell rather than failing the whole load; the raw text
+    is still in the CSV.
+    """
+    vals = [None if row.get(csv_name) in (None, "") else str(row[csv_name])
+            for csv_name, _, _ in SNOWFLAKE_COLUMNS]
+    custom = {k.removeprefix("Asset: "): v for k, v in row.items()
+              if k.startswith("Asset: ") and v not in (None, "")}
+    vals.append(json.dumps(custom) if custom else None)
+    vals.append(run_id)
+    return vals
+
+
+def snowflake_insert_sql(fq_table, n_rows):
+    # Every VALUES column is cast to VARCHAR first: a column that is NULL in
+    # every row of a chunk is otherwise typed NULL, which the TRY_ functions
+    # (string-only) reject.
+    convert = {"TIMESTAMP_TZ": "TRY_TO_TIMESTAMP_TZ({}::VARCHAR)",
+               "NUMBER": "TRY_TO_NUMBER({}::VARCHAR)",
+               "BOOLEAN": "TRY_TO_BOOLEAN({}::VARCHAR)", "VARCHAR": "{}::VARCHAR"}
+    width = len(SNOWFLAKE_COLUMNS) + 2
+    select = [convert[kind].format(f"COLUMN{i}")
+              for i, (_, _, kind) in enumerate(SNOWFLAKE_COLUMNS, start=1)]
+    select += [f"PARSE_JSON(COLUMN{width - 1}::VARCHAR)", f"COLUMN{width}::VARCHAR"]
+    names = [name for _, name, _ in SNOWFLAKE_COLUMNS] + ["CUSTOM_ATTRIBUTES", "RUN_ID"]
+    one = "(" + ", ".join(["%s"] * width) + ")"
+    return (f"INSERT INTO {fq_table} ({', '.join(names)})\n"
+            f"SELECT {', '.join(select)}\n"
+            f"FROM VALUES {', '.join([one] * n_rows)}")
+
+
+def load_snowflake(conn, cfg, rows, replace_projects, run_id):
+    """Write rows to the table in one transaction.
+
+    replace: delete then insert, scoped to replace_projects - a run filtered by
+             --project_id or --hub_id leaves every other project's rows alone.
+    append:  insert only; RUN_ID tells the runs apart.
+    """
+    fq = cfg["fq_table"]
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            (cfg["schema"], cfg["table"]))
+        if not cur.fetchone()[0]:
+            cur.execute(snowflake_ddl(fq))
+            LOG.info("snowflake: created %s", fq)
+
+        # DDL commits implicitly in Snowflake, so the transaction starts after it.
+        cur.execute("BEGIN")
+        deleted = 0
+        if cfg["mode"] == "replace" and replace_projects:
+            ids = sorted(replace_projects)
+            cur.execute(f"DELETE FROM {fq} WHERE PROJECT_ID IN ({', '.join(['%s'] * len(ids))})",
+                        ids)
+            deleted = cur.rowcount or 0
+        for i in range(0, len(rows), SNOWFLAKE_CHUNK):
+            chunk = rows[i:i + SNOWFLAKE_CHUNK]
+            params = [v for r in chunk for v in snowflake_values(r, run_id)]
+            cur.execute(snowflake_insert_sql(fq, len(chunk)), params)
+        cur.execute("COMMIT")
+
+        # Read back: proves the rows landed, not just that the statements ran.
+        cur.execute(f"SELECT COUNT(*) FROM {fq} WHERE RUN_ID = %s", (run_id,))
+        landed = cur.fetchone()[0]
+        LOG.info("snowflake: %s %s - %d row(s) deleted, %d inserted (run %s)",
+                 cfg["mode"], fq, deleted, landed, run_id)
+        if landed != len(rows):
+            raise RuntimeError(f"snowflake: expected {len(rows)} row(s) for run "
+                               f"{run_id}, found {landed}")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
+# --------------------------------------------------------------------------
 def sweep_project(proj, token, include_folders, stats):
     """Every (asset, reference) row for one project. [] if it has no Assets."""
     try:
@@ -799,6 +1043,11 @@ def main():
         "include_folder_path": "false",
         "split_by_project": "false",
         "write_latest": "true",
+        "snowflake_secret_name": "",
+        "snowflake_database": "",
+        "snowflake_schema": "",
+        "snowflake_table": "ACC_ASSET_FILE_METADATA",
+        "snowflake_mode": "replace",
     }
     for key, default in optional.items():
         flag = f"--{key}"
@@ -823,6 +1072,12 @@ def main():
     sm = boto3.client("secretsmanager")
     creds = json.loads(sm.get_secret_value(SecretId=args["secret_name"])["SecretString"])
     creds = normalise_key(creds)
+    sf_cfg = None
+    if optional["snowflake_secret_name"]:
+        sf_secret = json.loads(sm.get_secret_value(
+            SecretId=optional["snowflake_secret_name"])["SecretString"])
+        sf_cfg = snowflake_config(sf_secret, optional)
+        LOG.info("snowflake: will %s %s", sf_cfg["mode"], sf_cfg["fq_table"])
     token = ApsToken(creds, optional["scopes"])
     s3 = boto3.client("s3")
 
@@ -836,11 +1091,15 @@ def main():
              " (filtered)" if project_filter or hub_filter else "")
 
     rows, by_project = [], {}
+    clean_projects = set()   # swept start to finish with no error
     for proj in projects:
+        swept_before, errors_before = stats["projects_swept"], stats["errors"]
         project_rows = sweep_project(proj, token, include_folders, stats)
         rows += project_rows
         if project_rows:
             by_project[proj["id"]] = project_rows
+        if stats["projects_swept"] > swept_before and stats["errors"] == errors_before:
+            clean_projects.add(proj["id"])
 
     if not rows:
         # No CSV at all is a worse outcome than an empty one: a downstream reader
@@ -857,6 +1116,28 @@ def main():
         for pid, project_rows in by_project.items():
             put_csv(s3, bucket, f"{prefix}/_metadata/project={pid}/latest.csv",
                     to_csv(project_rows))
+
+    if sf_cfg:
+        # Only projects swept cleanly are replaced. A project that hit an error
+        # has partial rows, and swapping them in would delete good rows from the
+        # last run; its old rows stay until a clean run. Skipped projects (no
+        # Assets access) are left alone too - a 403 is not proof of no assets.
+        sf_rows = rows
+        if sf_cfg["mode"] == "replace":
+            sf_rows = [r for r in rows if r["Project Id"] in clean_projects]
+            for pid in sorted(set(by_project) - clean_projects):
+                LOG.warning("snowflake: project %s had errors - keeping its "
+                            "previous rows rather than replacing them", pid)
+        try:
+            conn = snowflake_connect(sf_cfg)
+            try:
+                load_snowflake(conn, sf_cfg, sf_rows, clean_projects, run_id)
+            finally:
+                conn.close()
+        except Exception as e:
+            # The CSV is already written; fail the run, but not before that.
+            LOG.error("snowflake load failed: %s: %s", type(e).__name__, e)
+            stats["errors"] += 1
 
     LOG.info("done: %s", json.dumps(stats))
     if not projects:

@@ -155,6 +155,12 @@ Sweeping every project makes this job longer than the extraction job, not
 heavier — it transfers nothing. If it ever approaches Glue's timeout, `--hub_id`
 or a comma-separated `--project_id` splits it across runs.
 
+To also load the rows into Snowflake (`--snowflake_secret_name`), add
+`secretsmanager:GetSecretValue` on that secret's ARN (again with the trailing
+`-*`), and add `snowflake-connector-python==3.13.2` to
+`--additional-python-modules`. Don't use a newer connector: 3.16+ brings its own
+boto3 and replaces the one Glue ships.
+
 If you point `--csv_key` somewhere outside `${PREFIX}/`, widen the
 `WriteExtractedFiles` resource to match — otherwise the run does all its work
 and 403s on the final `put_object`.
