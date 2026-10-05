@@ -99,12 +99,19 @@ The job also loads its rows into a Snowflake table when it is given
    job role can read it.
 3. Add it to the Environment's `EXTRA_ARGS_JSON`, for example
    `{"--snowflake_secret_name":"snowflake/acc-loader"}`. Optional overrides:
-   `--snowflake_database`, `--snowflake_schema`, `--snowflake_table` (default
-   `ACC_ASSET_FILE_METADATA`) and `--snowflake_mode` (`replace` or `append`).
+   `--snowflake_database`, `--snowflake_schema`, `--snowflake_table` and
+   `--snowflake_mode`:
+   - `replace` (default): the table holds the latest sweep of each project.
+   - `append`: every run's full set of rows, tagged by `RUN_ID`.
+   - `history`: one row per version, written only when something changed, with
+     `VALID_FROM`/`VALID_TO`/`IS_CURRENT`/`IS_DELETED` and a `<table>_CURRENT`
+     view. Default table `ACC_ASSET_FILE_METADATA_HISTORY`.
 
 On the Snowflake side, the role needs USAGE on the warehouse, database and
 schema. It needs CREATE TABLE on the schema for the first run, or you can create
 the table up front. After that it needs SELECT, INSERT and DELETE on the table.
+`history` mode also needs UPDATE on the table, and CREATE TABLE on the schema
+on every run, because each run stages its rows in a temporary table.
 If the Snowflake account has a network policy, it must allow the job's egress
 addresses. A Glue job with no VPC connection egresses from AWS's shared ranges,
 so a strict policy needs the job on a VPC connection with a NAT gateway that

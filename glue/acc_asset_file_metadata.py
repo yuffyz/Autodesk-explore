@@ -60,8 +60,11 @@ JOB PARAMETERS (--key value)
                          set, the rows are ALSO loaded into a Snowflake table
   --snowflake_database   default: the secret's "database"
   --snowflake_schema     default: the secret's "schema"
-  --snowflake_table      default: ACC_ASSET_FILE_METADATA (created if missing)
-  --snowflake_mode       "replace" (default) or "append"; see SNOWFLAKE below
+  --snowflake_table      default: ACC_ASSET_FILE_METADATA, or
+                         ACC_ASSET_FILE_METADATA_HISTORY in history mode
+                         (created if missing)
+  --snowflake_mode       "replace" (default), "append" or "history"; see
+                         SNOWFLAKE below
 
 OUTPUT
   s3://<bucket>/<prefix>/_metadata/run=<timestamp>.csv   every project, one file
@@ -98,6 +101,32 @@ SNOWFLAKE
            sweep of each project".
   append   inserts every run's rows; RUN_ID tells runs apart. History, at the
            cost of filtering on the latest RUN_ID per project downstream.
+  history  one row per VERSION of each (project, asset, document), written only
+           when something changed. Each row carries VALID_FROM / VALID_TO,
+           IS_CURRENT and IS_DELETED; a view <table>_CURRENT shows today's state.
+             new reference        -> new current row
+             anything changed     -> old row closed (VALID_TO), new row current
+             (new file version, rename, category, status, custom attribute...)
+             nothing changed      -> nothing written
+             reference removed    -> current row closed with IS_DELETED = true
+           Change is a hash of every loaded column except Extracted At. Removals
+           are only recorded for projects swept with no errors - a missing row
+           from a failed or filtered sweep is not a deletion.
+
+           The ACC side is still a full sweep: whether a reference changed can
+           only be known by reading it, since a new file version or a new
+           reference does not reliably bump the asset's updatedAt. What history
+           saves is storage and noise, not APS calls.
+
+           Two things register as changes that are not edits in ACC, so keep
+           them steady on a history table: toggling --include_folder_path
+           (Folder Path appears or vanishes on every row), and a category/status
+           lookup that fails one run and succeeds the next (those columns go
+           blank, then back - the failed lookup logs a warning that run).
+
+           history needs CREATE TABLE on the schema every run, not just the
+           first: the run is staged in a TEMPORARY table, which Snowflake grants
+           through the same privilege. UPDATE on the table as well.
 
   Snowflake secret (JSON), key-pair auth preferred:
   {"account","user","private_key","private_key_passphrase"?,"role"?,
@@ -147,6 +176,7 @@ logged warning and an empty column rather than failing the run, so a wrong guess
 costs a column, not the report.
 """
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -824,10 +854,13 @@ def snowflake_config(secret, optional):
         raise RuntimeError("snowflake secret needs private_key (preferred) or password")
     database = optional["snowflake_database"] or secret.get("database", "")
     schema = optional["snowflake_schema"] or secret.get("schema", "")
-    table = optional["snowflake_table"]
     mode = optional["snowflake_mode"].lower()
-    if mode not in ("replace", "append"):
-        raise RuntimeError(f"--snowflake_mode must be replace or append, got {mode!r}")
+    if mode not in ("replace", "append", "history"):
+        raise RuntimeError(f"--snowflake_mode must be replace, append or history, got {mode!r}")
+    # history has a different shape (validity columns), so it gets its own
+    # default table rather than colliding with one a replace/append run made.
+    table = optional["snowflake_table"] or (
+        "ACC_ASSET_FILE_METADATA_HISTORY" if mode == "history" else "ACC_ASSET_FILE_METADATA")
     fq_table = ".".join([sf_ident(database, "database"), sf_ident(schema, "schema"),
                          sf_ident(table, "table")])
     return {"secret": secret, "database": database.upper(), "schema": schema.upper(),
@@ -871,14 +904,49 @@ def snowflake_connect(cfg):
     return snowflake.connector.connect(**kwargs)
 
 
-def snowflake_ddl(fq_table):
-    cols = [f"{name} {kind}" for _, name, kind in SNOWFLAKE_COLUMNS]
-    cols += ["CUSTOM_ATTRIBUTES VARIANT", "RUN_ID VARCHAR",
-             "LOADED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()"]
-    return f"CREATE TABLE {fq_table} (\n  " + ",\n  ".join(cols) + "\n)"
+def snowflake_ddl(fq_table, kind="table"):
+    """table: replace/append. history: plus key, hash and validity columns.
+    stage: history's per-run scratch table - data plus key and hash."""
+    cols = [f"{name} {typ}" for _, name, typ in SNOWFLAKE_COLUMNS]
+    cols += ["CUSTOM_ATTRIBUTES VARIANT", "RUN_ID VARCHAR"]
+    if kind == "table":
+        cols += ["LOADED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()"]
+    else:
+        cols += ["ROW_KEY VARCHAR", "ROW_HASH VARCHAR"]
+    if kind == "history":
+        cols += ["VALID_FROM TIMESTAMP_TZ", "VALID_TO TIMESTAMP_TZ",
+                 "IS_CURRENT BOOLEAN", "IS_DELETED BOOLEAN"]
+    create = "CREATE OR REPLACE TEMPORARY TABLE" if kind == "stage" else "CREATE TABLE"
+    return f"{create} {fq_table} (\n  " + ",\n  ".join(cols) + "\n)"
 
 
-def snowflake_values(row, run_id):
+# Left out of the change hash: it moves on every run by definition, so hashing
+# it would make every row look changed every time.
+UNHASHED_COLUMNS = {"Extracted At"}
+
+
+def row_identity(row):
+    """(key, hash) for history mode.
+
+    The key is what makes a row "the same row" across runs: one asset
+    referencing one document lineage in one project. The lineage, not the
+    version, so a new upload of the same document is a change to the row
+    rather than a new row.
+
+    The hash covers every other value as it is loaded - including the custom
+    attributes - so any edit visible in the table is a change, and nothing
+    outside the table can register as one.
+    """
+    key = "|".join(str(row.get(k) or "") for k in ("Project Id", "Asset Id", "Lineage URN"))
+    values = {c: (None if row.get(c) in (None, "") else str(row[c]))
+              for c, _, _ in SNOWFLAKE_COLUMNS if c not in UNHASHED_COLUMNS}
+    values["custom"] = {k: str(v) for k, v in row.items()
+                        if k.startswith("Asset: ") and v not in (None, "")}
+    digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+    return key, digest
+
+
+def snowflake_values(row, run_id, keyed=False):
     """One row as bind values: every typed column as text, converted in SQL.
 
     Converting server-side with TRY_ functions means one malformed timestamp
@@ -891,44 +959,86 @@ def snowflake_values(row, run_id):
               if k.startswith("Asset: ") and v not in (None, "")}
     vals.append(json.dumps(custom) if custom else None)
     vals.append(run_id)
+    if keyed:
+        vals.extend(row_identity(row))
     return vals
 
 
-def snowflake_insert_sql(fq_table, n_rows):
+def snowflake_insert_sql(fq_table, n_rows, keyed=False):
     # Every VALUES column is cast to VARCHAR first: a column that is NULL in
     # every row of a chunk is otherwise typed NULL, which the TRY_ functions
     # (string-only) reject.
     convert = {"TIMESTAMP_TZ": "TRY_TO_TIMESTAMP_TZ({}::VARCHAR)",
                "NUMBER": "TRY_TO_NUMBER({}::VARCHAR)",
                "BOOLEAN": "TRY_TO_BOOLEAN({}::VARCHAR)", "VARCHAR": "{}::VARCHAR"}
-    width = len(SNOWFLAKE_COLUMNS) + 2
+    tail = ["RUN_ID"] + (["ROW_KEY", "ROW_HASH"] if keyed else [])
+    n = len(SNOWFLAKE_COLUMNS)
+    width = n + 1 + len(tail)
     select = [convert[kind].format(f"COLUMN{i}")
               for i, (_, _, kind) in enumerate(SNOWFLAKE_COLUMNS, start=1)]
-    select += [f"PARSE_JSON(COLUMN{width - 1}::VARCHAR)", f"COLUMN{width}::VARCHAR"]
-    names = [name for _, name, _ in SNOWFLAKE_COLUMNS] + ["CUSTOM_ATTRIBUTES", "RUN_ID"]
+    select += [f"PARSE_JSON(COLUMN{n + 1}::VARCHAR)"]
+    select += [f"COLUMN{i}::VARCHAR" for i in range(n + 2, width + 1)]
+    names = [name for _, name, _ in SNOWFLAKE_COLUMNS] + ["CUSTOM_ATTRIBUTES"] + tail
     one = "(" + ", ".join(["%s"] * width) + ")"
     return (f"INSERT INTO {fq_table} ({', '.join(names)})\n"
             f"SELECT {', '.join(select)}\n"
             f"FROM VALUES {', '.join([one] * n_rows)}")
 
 
-def load_snowflake(conn, cfg, rows, replace_projects, run_id):
+def snowflake_has_column(cur, cfg, column):
+    cur.execute(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (cfg["schema"], cfg["table"], column))
+    return bool(cur.fetchone()[0])
+
+
+def ensure_snowflake_table(cur, cfg):
+    """Create the table on first use; refuse one built for the other shape.
+
+    Pointing history mode at a replace/append table (or the reverse) would
+    otherwise fail half-way through the load with a missing-column error.
+    """
+    fq, history = cfg["fq_table"], cfg["mode"] == "history"
+    cur.execute(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+        (cfg["schema"], cfg["table"]))
+    if not cur.fetchone()[0]:
+        cur.execute(snowflake_ddl(fq, "history" if history else "table"))
+        LOG.info("snowflake: created %s", fq)
+        if history:
+            try:
+                cur.execute(f"CREATE VIEW IF NOT EXISTS {fq}_CURRENT AS "
+                            f"SELECT * EXCLUDE (VALID_TO, IS_CURRENT, IS_DELETED) "
+                            f"FROM {fq} WHERE IS_CURRENT")
+                LOG.info("snowflake: created view %s_CURRENT", fq)
+            except Exception as e:   # a convenience; the table is what matters
+                LOG.warning("snowflake: could not create %s_CURRENT (%s) - "
+                            "filter on IS_CURRENT instead", fq, e)
+        return
+    if snowflake_has_column(cur, cfg, "ROW_HASH") != history:
+        raise RuntimeError(
+            f"{fq} exists but was built for "
+            f"{'replace/append' if history else 'history'} mode. Use another "
+            f"--snowflake_table, or the mode it was created with.")
+
+
+def load_snowflake(conn, cfg, rows, clean_projects, run_id, run_at):
     """Write rows to the table in one transaction.
 
-    replace: delete then insert, scoped to replace_projects - a run filtered by
+    replace: delete then insert, scoped to clean_projects - a run filtered by
              --project_id or --hub_id leaves every other project's rows alone.
     append:  insert only; RUN_ID tells the runs apart.
+    history: only what changed since the last run; see load_snowflake_history.
     """
+    if cfg["mode"] == "history":
+        return load_snowflake_history(conn, cfg, rows, clean_projects, run_id, run_at)
     fq = cfg["fq_table"]
+    replace_projects = clean_projects
     cur = conn.cursor()
     try:
-        cur.execute(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
-            (cfg["schema"], cfg["table"]))
-        if not cur.fetchone()[0]:
-            cur.execute(snowflake_ddl(fq))
-            LOG.info("snowflake: created %s", fq)
+        ensure_snowflake_table(cur, cfg)
 
         # DDL commits implicitly in Snowflake, so the transaction starts after it.
         cur.execute("BEGIN")
@@ -952,6 +1062,103 @@ def load_snowflake(conn, cfg, rows, replace_projects, run_id):
         if landed != len(rows):
             raise RuntimeError(f"snowflake: expected {len(rows)} row(s) for run "
                                f"{run_id}, found {landed}")
+    except Exception:
+        try:
+            cur.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
+def load_snowflake_history(conn, cfg, rows, clean_projects, run_id, run_at):
+    """Keep one row per version of each (project, asset, document) and write
+    only what changed since the last run.
+
+    Each row has VALID_FROM / VALID_TO and IS_CURRENT. Against the current rows:
+
+      new       key not current in the table      -> insert
+      changed   key current, hash differs         -> close the old row, insert
+      unchanged key current, hash matches         -> nothing written
+      removed   key current, absent from this run -> close it, IS_DELETED
+
+    "Removed" is decided only for clean_projects. Absence from a project that
+    errored part-way, was skipped, or was filtered out of this run proves
+    nothing, and treating it as deletion would close every row it holds. New and
+    changed rows are taken from every swept project: a change seen is real even
+    when the sweep around it was incomplete.
+
+    The run's rows go to a temporary table first, so the comparison is three
+    set-based statements rather than a round trip per row.
+    """
+    fq = cfg["fq_table"]
+    stage = f"{fq}_RUN_STAGE"   # TEMPORARY: private to this session, dropped with it
+    cur = conn.cursor()
+    try:
+        ensure_snowflake_table(cur, cfg)
+        cur.execute(snowflake_ddl(stage, "stage"))
+        for i in range(0, len(rows), SNOWFLAKE_CHUNK):
+            chunk = rows[i:i + SNOWFLAKE_CHUNK]
+            params = [v for r in chunk for v in snowflake_values(r, run_id, keyed=True)]
+            cur.execute(snowflake_insert_sql(stage, len(chunk), keyed=True), params)
+
+        cur.execute("BEGIN")
+        cur.execute(
+            f"UPDATE {fq} t SET VALID_TO = TO_TIMESTAMP_TZ(%s), IS_CURRENT = FALSE "
+            f"FROM (SELECT DISTINCT ROW_KEY, ROW_HASH FROM {stage}) s "
+            f"WHERE t.ROW_KEY = s.ROW_KEY AND t.IS_CURRENT AND t.ROW_HASH <> s.ROW_HASH",
+            (run_at,))
+        changed = cur.rowcount or 0
+
+        removed = 0
+        ids = sorted(clean_projects)
+        in_clean = f"PROJECT_ID IN ({', '.join(['%s'] * len(ids))})"
+        if ids:
+            cur.execute(
+                f"UPDATE {fq} t SET VALID_TO = TO_TIMESTAMP_TZ(%s), IS_CURRENT = FALSE, "
+                f"IS_DELETED = TRUE "
+                f"WHERE t.IS_CURRENT AND t.{in_clean} "
+                f"AND NOT EXISTS (SELECT 1 FROM {stage} s WHERE s.ROW_KEY = t.ROW_KEY)",
+                [run_at] + ids)
+            removed = cur.rowcount or 0
+
+        data = [name for _, name, _ in SNOWFLAKE_COLUMNS] + [
+            "CUSTOM_ATTRIBUTES", "RUN_ID", "ROW_KEY", "ROW_HASH"]
+        # Changed rows were closed above, so "no current row" now covers both
+        # new and changed. QUALIFY guards against a key appearing twice in one
+        # run, which would otherwise create two current rows for it.
+        cur.execute(
+            f"INSERT INTO {fq} ({', '.join(data)}, VALID_FROM, VALID_TO, IS_CURRENT, IS_DELETED) "
+            f"SELECT {', '.join('s.' + c for c in data)}, TO_TIMESTAMP_TZ(%s), NULL, TRUE, FALSE "
+            f"FROM {stage} s "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {fq} t WHERE t.ROW_KEY = s.ROW_KEY AND t.IS_CURRENT) "
+            f"QUALIFY ROW_NUMBER() OVER (PARTITION BY s.ROW_KEY ORDER BY s.ROW_HASH) = 1",
+            (run_at,))
+        inserted = cur.rowcount or 0
+
+        # Check before COMMIT, so a wrong result is rolled back rather than
+        # reported: no key may have two current rows, and each clean project's
+        # current rows must be exactly the keys this run saw for it.
+        cur.execute(f"SELECT COUNT(*) FROM (SELECT ROW_KEY FROM {fq} WHERE IS_CURRENT "
+                    f"GROUP BY ROW_KEY HAVING COUNT(*) > 1)")
+        doubled = cur.fetchone()[0]
+        if doubled:
+            raise RuntimeError(f"{doubled} key(s) would have two current rows")
+        if ids:
+            cur.execute(f"SELECT COUNT(*) FROM {fq} WHERE IS_CURRENT AND {in_clean}", ids)
+            current = cur.fetchone()[0]
+            cur.execute(f"SELECT COUNT(DISTINCT ROW_KEY) FROM {stage} WHERE {in_clean}", ids)
+            seen = cur.fetchone()[0]
+            if current != seen:
+                raise RuntimeError(f"clean projects hold {current} current row(s) but "
+                                   f"this run saw {seen}")
+        cur.execute("COMMIT")
+
+        new = inserted - changed
+        LOG.info("snowflake: history %s - %d new, %d changed, %d removed, %d unchanged "
+                 "(run %s)", fq, new, changed, removed,
+                 len({row_identity(r)[0] for r in rows}) - inserted, run_id)
     except Exception:
         try:
             cur.execute("ROLLBACK")
@@ -1046,7 +1253,7 @@ def main():
         "snowflake_secret_name": "",
         "snowflake_database": "",
         "snowflake_schema": "",
-        "snowflake_table": "ACC_ASSET_FILE_METADATA",
+        "snowflake_table": "",
         "snowflake_mode": "replace",
     }
     for key, default in optional.items():
@@ -1081,7 +1288,8 @@ def main():
     token = ApsToken(creds, optional["scopes"])
     s3 = boto3.client("s3")
 
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    started = datetime.now(timezone.utc)
+    run_id = started.strftime("%Y%m%dT%H%M%SZ")
     stats = {"projects_discovered": 0, "projects_swept": 0, "projects_skipped": 0,
              "assets": 0, "references": 0, "rows": 0, "no_file": 0, "errors": 0}
 
@@ -1128,10 +1336,15 @@ def main():
             for pid in sorted(set(by_project) - clean_projects):
                 LOG.warning("snowflake: project %s had errors - keeping its "
                             "previous rows rather than replacing them", pid)
+        elif sf_cfg["mode"] == "history":
+            for pid in sorted({p["id"] for p in projects} - clean_projects):
+                LOG.info("snowflake: project %s not swept cleanly - recording its "
+                         "changes but not its removals this run", pid)
         try:
             conn = snowflake_connect(sf_cfg)
             try:
-                load_snowflake(conn, sf_cfg, sf_rows, clean_projects, run_id)
+                load_snowflake(conn, sf_cfg, sf_rows, clean_projects, run_id,
+                               started.isoformat())
             finally:
                 conn.close()
         except Exception as e:
