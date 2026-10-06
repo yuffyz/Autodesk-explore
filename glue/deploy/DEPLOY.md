@@ -83,24 +83,28 @@ since none of these values are sensitive):
 | `TIMEOUT_MINUTES` | no | default `180` |
 | `EXTRA_ARGS_JSON` | no | extra job arguments for this account, for example `{"--hub_id":"b.xxx","--split_by_project":"true"}` |
 
-### Loading into Snowflake (optional)
+### Loading into Snowflake
 
-The job also loads its rows into a Snowflake table when it is given
-`--snowflake_secret_name`. To turn that on for an account:
+Every run also loads its rows into a Snowflake table. The credentials are read
+from the Secrets Manager secret `snowflake/acc-loader`; the name is fixed in the
+script (`SNOWFLAKE_SECRET_NAME`), not passed as a job parameter. Without that
+secret the job fails before it starts the sweep. To set up an account:
 
-1. Store the Snowflake credentials as their own secret. Key-pair auth is
-   preferred; `password` works in place of `private_key`:
+1. Store the Snowflake credentials as a secret named `snowflake/acc-loader`.
+   Key-pair auth is preferred; `password` works in place of `private_key`:
    ```json
    {"account": "xy12345.us-east-1", "user": "SVC_ACC_LOADER",
     "private_key": "-----BEGIN PRIVATE KEY-----\n...", "role": "ACC_LOADER",
     "warehouse": "LOAD_WH", "database": "RAW", "schema": "ACC"}
    ```
-2. Re-deploy the bootstrap stack with `SnowflakeSecretName=<that secret>` so the
-   job role can read it.
-3. Add it to the Environment's `EXTRA_ARGS_JSON`, for example
-   `{"--snowflake_secret_name":"snowflake/acc-loader"}`. Optional overrides:
+   ```bash
+   aws secretsmanager create-secret --name snowflake/acc-loader \
+       --secret-string file://snowflake.json && rm snowflake.json
+   ```
+2. Re-deploy the bootstrap stack so the job role can read that secret.
+3. Optionally, add overrides to the Environment's `EXTRA_ARGS_JSON`:
    `--snowflake_database`, `--snowflake_schema`, `--snowflake_table` and
-   `--snowflake_mode`:
+   `--snowflake_mode`. For example, `{"--snowflake_mode":"history"}`:
    - `replace` (default): the table holds the latest sweep of each project.
    - `append`: every run's full set of rows, tagged by `RUN_ID`.
    - `history`: one row per version, written only when something changed, with

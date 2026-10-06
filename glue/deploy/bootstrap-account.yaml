@@ -38,19 +38,12 @@ Parameters:
     Type: String
     Default: aps/acc-extract
     Description: Secrets Manager secret holding the APS credentials
-  SnowflakeSecretName:
-    Type: String
-    Default: ""
-    Description: >
-      Secrets Manager secret holding Snowflake credentials, if the job loads
-      Snowflake (--snowflake_secret_name). Empty: no Snowflake access granted.
   JobName:
     Type: String
     Default: acc-asset-file-metadata
 
 Conditions:
   MakeOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
-  UseSnowflake: !Not [!Equals [!Ref SnowflakeSecretName, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -83,13 +76,12 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*
-              - !If
-                - UseSnowflake
-                - Sid: ReadTheSnowflakeCredentials
-                  Effect: Allow
-                  Action: secretsmanager:GetSecretValue
-                  Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SnowflakeSecretName}-*
-                - !Ref AWS::NoValue
+              # The job reads this name from SNOWFLAKE_SECRET_NAME in the
+              # script, not from a job parameter - change both together.
+              - Sid: ReadTheSnowflakeCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:snowflake/acc-loader-*
               - Sid: WriteTheCsv
                 Effect: Allow
                 Action: s3:PutObject

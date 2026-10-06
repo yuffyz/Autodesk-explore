@@ -56,8 +56,6 @@ JOB PARAMETERS (--key value)
                          per *new* folder, cached; off by default)
   --split_by_project     "true" to ALSO write a per-project CSV each run
   --write_latest         "false" to skip the stable latest.csv copy
-  --snowflake_secret_name  OPTIONAL secret holding Snowflake credentials; when
-                         set, the rows are ALSO loaded into a Snowflake table
   --snowflake_database   default: the secret's "database"
   --snowflake_schema     default: the secret's "schema"
   --snowflake_table      default: ACC_ASSET_FILE_METADATA, or
@@ -83,9 +81,13 @@ OUTPUT
   pandas/Athena, if that matters.
 
 SNOWFLAKE
-  Off unless --snowflake_secret_name is given. The CSV is always written first,
-  so a Snowflake failure costs the table load, not the report - the run still
-  exits non-zero so it is noticed.
+  Every run loads the rows into Snowflake too. The credentials come from the
+  Secrets Manager secret named in SNOWFLAKE_SECRET_NAME (snowflake/acc-loader),
+  not from a job parameter: the name is fixed in code, so the IAM grant and the
+  script cannot drift apart. A missing or malformed secret fails the run before
+  the sweep starts. The CSV is always written before the load, so a Snowflake
+  failure costs the table load, not the report - the run still exits non-zero
+  so it is noticed.
 
   The table has fixed, typed columns (snake-case versions of the CSV headers,
   e.g. "Create date" -> FILE_CREATED_AT TIMESTAMP_TZ, "Size (bytes)" ->
@@ -158,8 +160,8 @@ JOB SETUP
                                 snowflake-connector-python==3.13.2
                   (3.13.2, not newer: 3.16+ pulls in its own boto3 and
                   replaces the one Glue ships)
-  IAM             secretsmanager:GetSecretValue on the secret (and on the
-                  Snowflake secret, if used),
+  IAM             secretsmanager:GetSecretValue on the secret and on the
+                  Snowflake secret (snowflake/acc-loader),
                   s3:PutObject on <prefix>/_metadata/*
                   (no s3:GetObject needed - this job never reads S3 back)
 
@@ -192,7 +194,7 @@ from datetime import datetime, timezone
 import boto3
 from awsglue.utils import getResolvedOptions
 
-SCRIPT_VERSION = "2026-10-05-a"   # logged at startup: proves which code S3 is serving
+SCRIPT_VERSION = "2026-10-06-a"   # logged at startup: proves which code S3 is serving
 
 LOG = logging.getLogger("acc_metadata")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -787,8 +789,12 @@ def put_csv(s3, bucket, key, text):
 
 
 # --------------------------------------------------------------------------
-# Snowflake  (optional - only when --snowflake_secret_name is given)
+# Snowflake
 # --------------------------------------------------------------------------
+# Fixed rather than a job parameter: bootstrap-account.yaml grants the job role
+# read on exactly this name, so change both together.
+SNOWFLAKE_SECRET_NAME = "snowflake/acc-loader"
+
 # CSV header -> (Snowflake column, type). Unlike the CSV header this is fixed:
 # custom attributes differ per project, so rather than ALTER the table each time
 # a project grows a new one, they travel together in one VARIANT column.
@@ -1250,7 +1256,6 @@ def main():
         "include_folder_path": "false",
         "split_by_project": "false",
         "write_latest": "true",
-        "snowflake_secret_name": "",
         "snowflake_database": "",
         "snowflake_schema": "",
         "snowflake_table": "",
@@ -1279,12 +1284,11 @@ def main():
     sm = boto3.client("secretsmanager")
     creds = json.loads(sm.get_secret_value(SecretId=args["secret_name"])["SecretString"])
     creds = normalise_key(creds)
-    sf_cfg = None
-    if optional["snowflake_secret_name"]:
-        sf_secret = json.loads(sm.get_secret_value(
-            SecretId=optional["snowflake_secret_name"])["SecretString"])
-        sf_cfg = snowflake_config(sf_secret, optional)
-        LOG.info("snowflake: will %s %s", sf_cfg["mode"], sf_cfg["fq_table"])
+    sf_secret = json.loads(sm.get_secret_value(
+        SecretId=SNOWFLAKE_SECRET_NAME)["SecretString"])
+    sf_cfg = snowflake_config(sf_secret, optional)
+    LOG.info("snowflake: will %s %s (credentials from %s)",
+             sf_cfg["mode"], sf_cfg["fq_table"], SNOWFLAKE_SECRET_NAME)
     token = ApsToken(creds, optional["scopes"])
     s3 = boto3.client("s3")
 
@@ -1325,32 +1329,31 @@ def main():
             put_csv(s3, bucket, f"{prefix}/_metadata/project={pid}/latest.csv",
                     to_csv(project_rows))
 
-    if sf_cfg:
-        # Only projects swept cleanly are replaced. A project that hit an error
-        # has partial rows, and swapping them in would delete good rows from the
-        # last run; its old rows stay until a clean run. Skipped projects (no
-        # Assets access) are left alone too - a 403 is not proof of no assets.
-        sf_rows = rows
-        if sf_cfg["mode"] == "replace":
-            sf_rows = [r for r in rows if r["Project Id"] in clean_projects]
-            for pid in sorted(set(by_project) - clean_projects):
-                LOG.warning("snowflake: project %s had errors - keeping its "
-                            "previous rows rather than replacing them", pid)
-        elif sf_cfg["mode"] == "history":
-            for pid in sorted({p["id"] for p in projects} - clean_projects):
-                LOG.info("snowflake: project %s not swept cleanly - recording its "
-                         "changes but not its removals this run", pid)
+    # Only projects swept cleanly are replaced. A project that hit an error
+    # has partial rows, and swapping them in would delete good rows from the
+    # last run; its old rows stay until a clean run. Skipped projects (no
+    # Assets access) are left alone too - a 403 is not proof of no assets.
+    sf_rows = rows
+    if sf_cfg["mode"] == "replace":
+        sf_rows = [r for r in rows if r["Project Id"] in clean_projects]
+        for pid in sorted(set(by_project) - clean_projects):
+            LOG.warning("snowflake: project %s had errors - keeping its "
+                        "previous rows rather than replacing them", pid)
+    elif sf_cfg["mode"] == "history":
+        for pid in sorted({p["id"] for p in projects} - clean_projects):
+            LOG.info("snowflake: project %s not swept cleanly - recording its "
+                     "changes but not its removals this run", pid)
+    try:
+        conn = snowflake_connect(sf_cfg)
         try:
-            conn = snowflake_connect(sf_cfg)
-            try:
-                load_snowflake(conn, sf_cfg, sf_rows, clean_projects, run_id,
-                               started.isoformat())
-            finally:
-                conn.close()
-        except Exception as e:
-            # The CSV is already written; fail the run, but not before that.
-            LOG.error("snowflake load failed: %s: %s", type(e).__name__, e)
-            stats["errors"] += 1
+            load_snowflake(conn, sf_cfg, sf_rows, clean_projects, run_id,
+                           started.isoformat())
+        finally:
+            conn.close()
+    except Exception as e:
+        # The CSV is already written; fail the run, but not before that.
+        LOG.error("snowflake load failed: %s: %s", type(e).__name__, e)
+        stats["errors"] += 1
 
     LOG.info("done: %s", json.dumps(stats))
     if not projects:
