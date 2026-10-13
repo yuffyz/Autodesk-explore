@@ -23,7 +23,7 @@ re-run the workflow at an older commit.
 
 ### 1. Prerequisites in the account
 
-- A bucket for the script (`CODE_BUCKET`) and a bucket for the CSV (`DATA_BUCKET`).
+- A bucket for the script (`AUTODESK_CODE_BUCKET`) and a bucket for the CSV (`AUTODESK_DATA_BUCKET`).
   They can be the same bucket.
 - The APS secret, in the same shape as the other accounts (see `make_secret.py`).
   The secret stays out of GitHub and out of this pipeline.
@@ -60,28 +60,30 @@ The stack creates:
   job never reads data back.
 
 If you already run the job under the role from `IAM_SETUP.md`, you can use that
-role's ARN for `GLUE_ROLE_ARN` instead. The deploy role's `iam:PassRole` then has
+role's ARN for `AUTODESK_GLUE_ROLE_ARN` instead. The deploy role's `iam:PassRole` then has
 to name that role.
 
 ### 3. Create the GitHub Environment
 
 *Repo → Settings → Environments → New environment* (for example `prod`). Use the
 same name you gave `GitHubEnvironment`. Then add **variables** (not secrets,
-since none of these values are sensitive):
+since none of these values are sensitive). Every name carries the `AUTODESK_`
+prefix; the workflow passes each one to `deploy_glue_job.sh` without it, so
+`AUTODESK_CODE_BUCKET` arrives as `CODE_BUCKET`:
 
 | Variable | Required | Value |
 |---|---|---|
-| `AWS_DEPLOY_ROLE_ARN` | yes | stack output `DeployRoleArn` |
-| `AWS_REGION` | yes | for example `us-east-1` |
-| `GLUE_ROLE_ARN` | yes | stack output `GlueJobRoleArn` |
-| `CODE_BUCKET` | yes | script bucket |
-| `DATA_BUCKET` | yes | CSV bucket, passed as `--s3_bucket` |
-| `SECRET_NAME` | yes | passed as `--secret_name` |
-| `JOB_NAME` | no | default `acc-asset-file-metadata` |
-| `CODE_PREFIX` | no | default `glue-scripts` (must match the stack) |
-| `S3_PREFIX` | no | default `acc/assets`, passed as `--s3_prefix` |
-| `TIMEOUT_MINUTES` | no | default `180` |
-| `EXTRA_ARGS_JSON` | no | extra job arguments for this account, for example `{"--hub_id":"b.xxx","--split_by_project":"true"}` |
+| `AUTODESK_AWS_DEPLOY_ROLE_ARN` | yes | stack output `DeployRoleArn` |
+| `AUTODESK_AWS_REGION` | yes | for example `us-east-1` |
+| `AUTODESK_GLUE_ROLE_ARN` | yes | stack output `GlueJobRoleArn` |
+| `AUTODESK_CODE_BUCKET` | yes | script bucket |
+| `AUTODESK_DATA_BUCKET` | yes | CSV bucket, passed as `--s3_bucket` |
+| `AUTODESK_SECRET_NAME` | yes | passed as `--secret_name` |
+| `AUTODESK_JOB_NAME` | no | default `acc-asset-file-metadata` |
+| `AUTODESK_CODE_PREFIX` | no | default `glue-scripts` (must match the stack) |
+| `AUTODESK_S3_PREFIX` | no | default `acc/assets`, passed as `--s3_prefix` |
+| `AUTODESK_TIMEOUT_MINUTES` | no | default `180` |
+| `AUTODESK_EXTRA_ARGS_JSON` | no | extra job arguments for this account, for example `{"--hub_id":"b.xxx","--split_by_project":"true"}` |
 
 ### Loading into Snowflake
 
@@ -102,7 +104,7 @@ secret the job fails before it starts the sweep. To set up an account:
        --secret-string file://snowflake.json && rm snowflake.json
    ```
 2. Re-deploy the bootstrap stack so the job role can read that secret.
-3. Optionally, add overrides to the Environment's `EXTRA_ARGS_JSON`:
+3. Optionally, add overrides to the Environment's `AUTODESK_EXTRA_ARGS_JSON`:
    `--snowflake_database`, `--snowflake_schema`, `--snowflake_table` and
    `--snowflake_mode`. For example, `{"--snowflake_mode":"history"}`:
    - `replace` (default): the table holds the latest sweep of each project.

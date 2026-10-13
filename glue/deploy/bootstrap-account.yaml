@@ -135,8 +135,8 @@ Resources:
 
 Outputs:
   DeployRoleArn:
-    Description: set as the AWS_DEPLOY_ROLE_ARN variable on the GitHub Environment
+    Description: set as the AUTODESK_AWS_DEPLOY_ROLE_ARN variable on the GitHub Environment
     Value: !GetAtt GitHubDeployRole.Arn
   GlueJobRoleArn:
-    Description: set as the GLUE_ROLE_ARN variable on the GitHub Environment
+    Description: set as the AUTODESK_GLUE_ROLE_ARN variable on the GitHub Environment
     Value: !GetAtt GlueJobRole.Arn

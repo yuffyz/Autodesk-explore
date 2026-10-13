@@ -72,20 +72,20 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.AUTODESK_AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AUTODESK_AWS_REGION }}
           role-session-name: gh-${{ github.run_id }}
 
       - name: Deploy Glue job
         run: glue/deploy/deploy_glue_job.sh
         env:
-          CODE_BUCKET: ${{ vars.CODE_BUCKET }}
-          GLUE_ROLE_ARN: ${{ vars.GLUE_ROLE_ARN }}
-          DATA_BUCKET: ${{ vars.DATA_BUCKET }}
-          SECRET_NAME: ${{ vars.SECRET_NAME }}
-          JOB_NAME: ${{ vars.JOB_NAME }}
-          CODE_PREFIX: ${{ vars.CODE_PREFIX }}
-          S3_PREFIX: ${{ vars.S3_PREFIX }}
-          TIMEOUT_MINUTES: ${{ vars.TIMEOUT_MINUTES }}
-          EXTRA_ARGS_JSON: ${{ vars.EXTRA_ARGS_JSON }}
+          CODE_BUCKET: ${{ vars.AUTODESK_CODE_BUCKET }}
+          GLUE_ROLE_ARN: ${{ vars.AUTODESK_GLUE_ROLE_ARN }}
+          DATA_BUCKET: ${{ vars.AUTODESK_DATA_BUCKET }}
+          SECRET_NAME: ${{ vars.AUTODESK_SECRET_NAME }}
+          JOB_NAME: ${{ vars.AUTODESK_JOB_NAME }}
+          CODE_PREFIX: ${{ vars.AUTODESK_CODE_PREFIX }}
+          S3_PREFIX: ${{ vars.AUTODESK_S3_PREFIX }}
+          TIMEOUT_MINUTES: ${{ vars.AUTODESK_TIMEOUT_MINUTES }}
+          EXTRA_ARGS_JSON: ${{ vars.AUTODESK_EXTRA_ARGS_JSON }}
           VERSION: ${{ github.sha }}
