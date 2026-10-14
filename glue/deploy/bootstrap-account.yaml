@@ -125,6 +125,14 @@ Resources:
                 Effect: Allow
                 Action: [glue:GetJob, glue:CreateJob, glue:UpdateJob]
                 Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${JobName}
+              # deploy_glue_job.sh checks the connection exists before
+              # attaching it; network-account.yaml names it <JobName>-egress.
+              - Sid: ReadTheJobConnection
+                Effect: Allow
+                Action: glue:GetConnection
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:connection/${JobName}-*
               - Sid: HandTheJobItsRole
                 Effect: Allow
                 Action: iam:PassRole

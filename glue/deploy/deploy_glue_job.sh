@@ -19,6 +19,10 @@
 #             TIMEOUT_MINUTES  default 180
 #             EXTRA_ARGS_JSON  default {} - merged into the job's default
 #                              arguments, e.g. {"--hub_id":"b.xxx"}
+#             GLUE_CONNECTION  default none - a Glue NETWORK connection to run
+#                              the job in, for a fixed egress IP (see
+#                              network-account.yaml). Unset detaches the job
+#                              from any connection it had.
 #             VERSION          default the git short sha (or "local")
 #
 # The script lands at a key that carries the version, never overwriting an
@@ -39,6 +43,7 @@ PYTHON_MODULES="${PYTHON_MODULES:-PyJWT==2.10.1,cryptography==43.0.1,snowflake-c
 PYTHON_VERSION="${PYTHON_VERSION:-3.9}"
 TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-180}"
 EXTRA_ARGS_JSON="${EXTRA_ARGS_JSON:-}"
+GLUE_CONNECTION="${GLUE_CONNECTION:-}"
 [ -n "$EXTRA_ARGS_JSON" ] || EXTRA_ARGS_JSON='{}'
 VERSION="${VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo local)}"
 
@@ -48,6 +53,17 @@ echo "$EXTRA_ARGS_JSON" | jq -e 'type == "object"' >/dev/null \
 
 account=$(aws sts get-caller-identity --query Account --output text)
 echo "deploying $JOB_NAME @ $VERSION to account $account"
+
+# Checked before anything is uploaded, so a wrong name fails here with a clear
+# message rather than as a job run that cannot start.
+if [ -n "$GLUE_CONNECTION" ]; then
+  conn_type=$(aws glue get-connection --name "$GLUE_CONNECTION" --hide-password \
+                --query 'Connection.ConnectionType' --output text) \
+    || { echo "glue connection $GLUE_CONNECTION not found (or not readable)" >&2; exit 1; }
+  echo "connection: $GLUE_CONNECTION ($conn_type)"
+else
+  echo "connection: none (job egresses from AWS's shared ranges)"
+fi
 
 script_name=$(basename "$SCRIPT_PATH")
 key="${CODE_PREFIX%/}/${JOB_NAME}/${VERSION}/${script_name}"
@@ -68,6 +84,7 @@ body=$(jq -n \
   --arg version "$VERSION" \
   --argjson timeout "$TIMEOUT_MINUTES" \
   --argjson extra   "$EXTRA_ARGS_JSON" \
+  --arg conn    "$GLUE_CONNECTION" \
   '{
      Description: ("ACC asset reference metadata -> CSV (deployed " + $version + ")"),
      Role: $role,
@@ -81,7 +98,7 @@ body=$(jq -n \
      MaxCapacity: 1.0,
      Timeout: $timeout,
      ExecutionProperty: {MaxConcurrentRuns: 1}
-   }')
+   } + (if $conn == "" then {} else {Connections: {Connections: [$conn]}} end)')
 
 if aws glue get-job --job-name "$JOB_NAME" >/dev/null 2>&1; then
   aws glue update-job --job-name "$JOB_NAME" --job-update "$body" >/dev/null
@@ -97,4 +114,10 @@ if [ "$deployed" != "s3://${CODE_BUCKET}/${key}" ]; then
   echo "job points at $deployed, expected s3://${CODE_BUCKET}/${key}" >&2
   exit 1
 fi
-echo "verified: $JOB_NAME -> $deployed"
+attached=$(aws glue get-job --job-name "$JOB_NAME" --output json \
+             | jq -r '(.Job.Connections.Connections // []) | join(",")')
+if [ "$attached" != "$GLUE_CONNECTION" ]; then
+  echo "job has connections '${attached}', expected '${GLUE_CONNECTION}'" >&2
+  exit 1
+fi
+echo "verified: $JOB_NAME -> $deployed${GLUE_CONNECTION:+ via $GLUE_CONNECTION}"

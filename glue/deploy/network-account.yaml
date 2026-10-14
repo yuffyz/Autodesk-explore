@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Optional, per AWS account: fixed egress for the ACC metadata Glue job. A small
+  dedicated VPC whose private subnet reaches the internet through a NAT gateway
+  on an Elastic IP, plus the Glue NETWORK connection the job attaches to. Every
+  call the job makes to the internet (Snowflake, APS, PyPI, Secrets Manager)
+  then leaves from that one address, so it can go on a Snowflake network policy.
+
+Parameters:
+  JobName:
+    Type: String
+    Default: acc-asset-file-metadata
+    Description: >
+      Names the resources. The connection is <JobName>-egress; the bootstrap
+      stack's deploy role may read connections named <JobName>-*.
+  VpcCidr:
+    Type: String
+    Default: 10.250.0.0/24
+    Description: must not overlap a VPC you may later peer this one with
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.250.0.0/26
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.250.0.64/26
+
+Resources:
+  # DNS support and hostnames: Glue needs both to resolve AWS endpoints, and the
+  # S3 gateway endpoint relies on them.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress" }]
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # One AZ: a Glue connection names a single subnet anyway, and a second NAT
+  # gateway would double the cost for a batch job that can simply be re-run.
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress-public" }]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress-public" }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # The fixed address. Retain it: deleting or replacing the stack must not
+  # release an IP that Snowflake's network policy depends on.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress" }]
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress" }]
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !GetAtt PublicSubnet.AvailabilityZone
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress-private" }]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress-private" }]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # S3 (the job script, the CSV) stays off the NAT gateway: free, and not
+  # billed per GB. Its traffic does not leave from the Elastic IP, which is
+  # fine -- only Snowflake checks the source address.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # Glue requires a self-referencing inbound rule for all TCP on the
+  # connection's security group, even for a single-node Python Shell job.
+  JobSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Glue job ${JobName}, egress through the NAT gateway
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${JobName}-egress" }]
+  JobSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref JobSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref JobSecurityGroup
+
+  GlueConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub ${JobName}-egress
+        Description: !Sub Private subnet behind the NAT gateway on ${NatEip}
+        ConnectionType: NETWORK
+        ConnectionProperties: {}
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !GetAtt PrivateSubnet.AvailabilityZone
+          SubnetId: !Ref PrivateSubnet
+          SecurityGroupIdList: [!Ref JobSecurityGroup]
+
+Outputs:
+  NatPublicIp:
+    Description: the job's fixed egress address -- allowlist <ip>/32 in Snowflake
+    Value: !Ref NatEip
+  GlueConnectionName:
+    Description: set as the AUTODESK_GLUE_CONNECTION variable on the GitHub Environment
+    Value: !Ref GlueConnection

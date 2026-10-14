@@ -88,4 +88,5 @@ jobs:
           S3_PREFIX: ${{ vars.AUTODESK_S3_PREFIX }}
           TIMEOUT_MINUTES: ${{ vars.AUTODESK_TIMEOUT_MINUTES }}
           EXTRA_ARGS_JSON: ${{ vars.AUTODESK_EXTRA_ARGS_JSON }}
+          GLUE_CONNECTION: ${{ vars.AUTODESK_GLUE_CONNECTION }}
           VERSION: ${{ github.sha }}

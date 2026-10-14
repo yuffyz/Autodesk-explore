@@ -84,6 +84,7 @@ prefix; the workflow passes each one to `deploy_glue_job.sh` without it, so
 | `AUTODESK_S3_PREFIX` | no | default `acc/assets`, passed as `--s3_prefix` |
 | `AUTODESK_TIMEOUT_MINUTES` | no | default `180` |
 | `AUTODESK_EXTRA_ARGS_JSON` | no | extra job arguments for this account, for example `{"--hub_id":"b.xxx","--split_by_project":"true"}` |
+| `AUTODESK_GLUE_CONNECTION` | no | Glue connection to run the job in, for a fixed egress IP: stack output `GlueConnectionName` (see below). Unset = no VPC; removing it detaches the job on the next deploy |
 
 ### Loading into Snowflake
 
@@ -119,9 +120,62 @@ the table up front. After that it needs SELECT, INSERT and DELETE on the table.
 `history` mode also needs UPDATE on the table, and CREATE TABLE on the schema
 on every run, because each run stages its rows in a temporary table.
 If the Snowflake account has a network policy, it must allow the job's egress
-addresses. A Glue job with no VPC connection egresses from AWS's shared ranges,
-so a strict policy needs the job on a VPC connection with a NAT gateway that
-has a fixed IP.
+address. Without a VPC connection the job egresses from AWS's shared ranges,
+which change, so put it on a fixed IP first (next section).
+
+### Fixed egress IP for a Snowflake allowlist (optional, once per account)
+
+`network-account.yaml` builds a small dedicated VPC for the job: a private
+subnet whose only way out is a NAT gateway on an Elastic IP, plus the Glue
+`NETWORK` connection the job attaches to. Everything the job calls on the
+internet (Snowflake, APS, PyPI for `--additional-python-modules`, Secrets
+Manager) then leaves from that one address. S3 goes through a gateway endpoint
+instead, which is free, and S3 doesn't check source addresses.
+
+1. Create the stack. The CloudFormation console works the same way as for step 2
+   (*With new resources (standard)*). It needs no IAM acknowledgment.
+   ```bash
+   aws cloudformation deploy \
+     --stack-name acc-asset-file-metadata-network \
+     --template-file glue/deploy/network-account.yaml
+
+   aws cloudformation describe-stacks --stack-name acc-asset-file-metadata-network \
+     --query 'Stacks[0].Outputs' --output table
+   ```
+   The default VPC range is `10.250.0.0/24`. Override `VpcCidr`,
+   `PublicSubnetCidr` and `PrivateSubnetCidr` if that clashes with a network you
+   may peer with.
+2. Re-deploy the bootstrap stack (step 2) so the deploy role can read the
+   connection (`glue:GetConnection` on `<JobName>-*`).
+3. Allowlist the `NatPublicIp` output in Snowflake, as `<ip>/32`. For example:
+   ```sql
+   CREATE NETWORK RULE acc_loader_egress MODE = INGRESS TYPE = IPV4
+     VALUE_LIST = ('203.0.113.10/32');
+   CREATE NETWORK POLICY acc_loader ALLOWED_NETWORK_RULE_LIST = ('acc_loader_egress');
+   ALTER USER SVC_ACC_LOADER SET NETWORK_POLICY = acc_loader;
+   ```
+   A policy on the service user alone leaves everyone else's access unchanged.
+   If an account-level policy already exists, add the IP to it instead.
+4. Set `AUTODESK_GLUE_CONNECTION` on the Environment to the `GlueConnectionName`
+   output, and deploy. The deploy fails before uploading anything if the
+   connection doesn't exist, and afterwards checks that the job is attached.
+
+Notes:
+
+- **Cost:** a NAT gateway costs about $33 a month plus $0.045 per GB processed,
+  even when the job isn't running. The Elastic IP is about $3.60 a month.
+- **The IP survives the stack.** The Elastic IP is retained if the stack is
+  deleted or replaced, so the Snowflake rule isn't silently broken. It then
+  stays in the account (and on the bill) until released by hand. A *new*
+  stack allocates a new IP.
+- **Single AZ.** A Glue connection names one subnet, so the job runs in one
+  AZ. If that AZ is down, the run fails and can be re-run later.
+- **An existing VPC works too.** If the account already has a private subnet
+  behind a NAT gateway with a fixed IP, create a Glue `NETWORK` connection in
+  it instead. Its security group needs a self-referencing inbound rule for all
+  TCP, and the subnet needs a route to S3. Name the connection `<JobName>-…`,
+  or widen `glue:GetConnection` in the bootstrap stack. Then set
+  `AUTODESK_GLUE_CONNECTION` to it.
 
 To gate production, add **Required reviewers** and restrict **Deployment
 branches** to `main` on that Environment. A deploy then waits for approval.
